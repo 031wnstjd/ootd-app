@@ -115,6 +115,53 @@ QDRANT_TIMEOUT_SECONDS = float(os.getenv("QDRANT_TIMEOUT_SECONDS", "10"))
 QDRANT_UPSERT_BATCH_SIZE = int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", "200"))
 CATEGORY_QUERY_PRIORITY = ["top", "bottom", "outer", "shoes", "bag"]
 DEFAULT_TARGET_GENDER = os.getenv("DEFAULT_TARGET_GENDER", "men")
+GENDER_MEN_TOKENS = [
+    "남성",
+    "남자",
+    "맨즈",
+    "men",
+    "mens",
+    "male",
+    "boy",
+    "for men",
+]
+GENDER_WOMEN_TOKENS = [
+    "여성",
+    "여자",
+    "우먼",
+    "우먼즈",
+    "우먼스",
+    "women",
+    "womens",
+    "female",
+    "girl",
+    "lady",
+    "for women",
+]
+GENDER_UNISEX_TOKENS = ["공용", "남녀", "유니섹스", "unisex"]
+PATTERN_TOKENS = [
+    "leopard",
+    "호피",
+    "paisley",
+    "페이즐리",
+    "floral",
+    "flower",
+    "플라워",
+    "도트",
+    "dot",
+    "lace",
+    "레이스",
+]
+DETAIL_TOKENS = [
+    "henley",
+    "헨리넥",
+    "raglan",
+    "래글런",
+    "v-neck",
+    "브이넥",
+    "crop",
+    "크롭",
+]
 
 
 @dataclass
@@ -756,6 +803,12 @@ class JobService:
                 continue
             if not self._is_gender_compatible(target_gender, effective_item_gender):
                 continue
+            if (
+                target_gender != TargetGender.unisex
+                and effective_item_gender == TargetGender.unisex
+                and self._has_opposite_gender_cue(target_gender, f"{item.brand} {item.product_name} {item.product_url}")
+            ):
+                continue
             if price_cap is not None and item.price is not None and item.price > price_cap:
                 continue
             if not item.embedding:
@@ -770,14 +823,34 @@ class JobService:
             text_score = 0.0
             category_score = 1.0 if category and item.category == category else 0.8
             price_score = self._price_fit_score(item.price, price_cap)
-            style_score = self._style_similarity_score(query_style.get(item.category), self._item_style_signature(item))
+            item_sig = self._item_style_signature(item)
+            style_score = self._style_similarity_score(query_style.get(item.category), item_sig)
             query_sig = query_style.get(item.category) or query_style.get("global")
             color_score = self._color_similarity_score(
                 query_rgb=(query_sig[0] if query_sig else [0.0, 0.0, 0.0]),
                 item_name=f"{item.brand} {item.product_name}",
+                item_rgb=item_sig[0],
             )
-            meta_score = (0.72 * style_score) + (0.20 * color_score) + (0.08 * price_score)
-            final = (0.72 * image_sim) + (0.20 * style_score) + (0.06 * color_score) + (0.02 * price_score)
+            attr_score = self._attribute_compatibility_score(
+                query_sig=query_sig,
+                item_name=f"{item.brand} {item.product_name}",
+                category=item.category,
+            )
+            if attr_score < 0.25:
+                continue
+            style_penalty = self._target_gender_style_penalty(
+                target_gender=target_gender,
+                category=item.category,
+                item_name=f"{item.brand} {item.product_name}",
+            )
+            meta_score = (0.58 * style_score) + (0.22 * color_score) + (0.20 * attr_score)
+            final = (
+                (0.54 * image_sim)
+                + (0.18 * style_score)
+                + (0.20 * color_score)
+                + (0.06 * attr_score)
+                + (0.02 * price_score)
+            ) * style_penalty
             score = ScoreBreakdown(
                 image=round(image_sim, 4),
                 text=round(text_score, 4),
@@ -796,6 +869,7 @@ class JobService:
                 "model:hist-embed",
                 "rerank:style-signature",
                 "rerank:color-compat",
+                "rerank:attr-compat",
                 f"target_gender:{target_gender.value}",
                 f"item_gender:{effective_item_gender.value}",
                 f"index:{'qdrant' if self._qdrant_client else 'memory'}",
@@ -804,6 +878,8 @@ class JobService:
                 tags.append(f"price_cap:{price_cap}")
             if color_hint_text:
                 tags.append(f"color:{color_hint_text}")
+            if style_penalty < 0.999:
+                tags.append("rerank:target-style-penalty")
             candidates.append((final, item, score, tags))
 
         candidates.sort(key=lambda row: row[0], reverse=True)
@@ -930,14 +1006,14 @@ class JobService:
                 regions: dict[str, RoiRegion] = {
                     "global": RoiRegion(category="global", bbox=[0.0, 0.0, 1.0, 1.0], confidence=0.92)
                 }
-                vectors["top"] = self._embedding_from_image(rgb.crop(crop_box(0.10, 0.05, 0.90, 0.45)))
-                regions["top"] = RoiRegion(category="top", bbox=[0.10, 0.05, 0.90, 0.45], confidence=0.86)
-                vectors["bottom"] = self._embedding_from_image(rgb.crop(crop_box(0.12, 0.45, 0.88, 0.82)))
-                regions["bottom"] = RoiRegion(category="bottom", bbox=[0.12, 0.45, 0.88, 0.82], confidence=0.88)
+                vectors["top"] = self._embedding_from_image(rgb.crop(crop_box(0.10, 0.05, 0.90, 0.46)))
+                regions["top"] = RoiRegion(category="top", bbox=[0.10, 0.05, 0.90, 0.46], confidence=0.86)
+                vectors["bottom"] = self._embedding_from_image(rgb.crop(crop_box(0.16, 0.40, 0.84, 0.78)))
+                regions["bottom"] = RoiRegion(category="bottom", bbox=[0.16, 0.40, 0.84, 0.78], confidence=0.88)
                 vectors["outer"] = self._embedding_from_image(rgb.crop(crop_box(0.06, 0.02, 0.94, 0.60)))
                 regions["outer"] = RoiRegion(category="outer", bbox=[0.06, 0.02, 0.94, 0.60], confidence=0.74)
-                vectors["shoes"] = self._embedding_from_image(rgb.crop(crop_box(0.15, 0.82, 0.85, 0.99)))
-                regions["shoes"] = RoiRegion(category="shoes", bbox=[0.15, 0.82, 0.85, 0.99], confidence=0.70)
+                vectors["shoes"] = self._embedding_from_image(rgb.crop(crop_box(0.15, 0.80, 0.85, 0.99)))
+                regions["shoes"] = RoiRegion(category="shoes", bbox=[0.15, 0.80, 0.85, 0.99], confidence=0.70)
 
                 bag_left = self._embedding_from_image(rgb.crop(crop_box(0.00, 0.25, 0.38, 0.80)))
                 bag_right = self._embedding_from_image(rgb.crop(crop_box(0.62, 0.25, 1.00, 0.80)))
@@ -1043,14 +1119,35 @@ class JobService:
             return len(fallback), len(fallback)
 
         with httpx.Client(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
-            for category, query in seeds.items():
-                discovered = self._crawl_goods_api(client, category, query, target_per_category)
-                if not discovered:
-                    discovered = self._crawl_search_page(client, category, query, target_per_category)
-                if len(discovered) < target_per_category and CATALOG_ALLOW_SYNTHETIC_PADDING:
-                    fallback = self._fallback_items_for_category(category, target_per_category - len(discovered))
-                    discovered.extend(fallback)
-                for item in discovered:
+            for category, queries in seeds.items():
+                merged: dict[str, CatalogItemRecord] = {}
+                if not queries:
+                    continue
+                per_query_target = max(80, math.ceil(target_per_category / len(queries)))
+                for query in queries:
+                    needed = target_per_category - len(merged)
+                    if needed <= 0:
+                        break
+                    fetch_target = min(target_per_category, max(40, min(per_query_target, needed)))
+                    discovered = self._crawl_goods_api(client, category, query, fetch_target)
+                    if not discovered:
+                        discovered = self._crawl_search_page(client, category, query, fetch_target)
+                    for item in discovered:
+                        merged[item.product_id] = item
+
+                if len(merged) < target_per_category:
+                    query = queries[0]
+                    discovered = self._crawl_goods_api(client, category, query, target_per_category)
+                    if not discovered:
+                        discovered = self._crawl_search_page(client, category, query, target_per_category)
+                    for item in discovered:
+                        merged[item.product_id] = item
+
+                discovered_items = list(merged.values())[:target_per_category]
+                if len(discovered_items) < target_per_category and CATALOG_ALLOW_SYNTHETIC_PADDING:
+                    fallback = self._fallback_items_for_category(category, target_per_category - len(discovered_items))
+                    discovered_items.extend(fallback)
+                for item in discovered_items:
                     products[item.product_id] = item
 
         indexed = 0
@@ -1237,7 +1334,7 @@ class JobService:
         cat_vec = query_vectors.get(category, [])
         global_vec = query_vectors.get("global", [])
         if cat_vec and global_vec and len(cat_vec) == len(global_vec):
-            mixed = [0.65 * c + 0.35 * g for c, g in zip(cat_vec, global_vec)]
+            mixed = [0.82 * c + 0.18 * g for c, g in zip(cat_vec, global_vec)]
             return self._normalize_vector(mixed)
         if cat_vec:
             return cat_vec
@@ -1334,14 +1431,14 @@ class JobService:
         return token[:120]
 
     @staticmethod
-    def _catalog_seed_queries() -> dict[str, str]:
+    def _catalog_seed_queries() -> dict[str, list[str]]:
         # Keep `bottom` for match pipeline compatibility while using "바지" keyword for crawl quality.
         return {
-            "shoes": "신발",
-            "top": "상의",
-            "outer": "아우터",
-            "bottom": "바지",
-            "bag": "가방",
+            "shoes": ["남성 신발", "남성 스니커즈", "남성 부츠"],
+            "top": ["남성 상의", "남성 맨투맨", "남성 니트", "남성 긴팔 티셔츠"],
+            "outer": ["남성 아우터", "남성 자켓", "남성 코트"],
+            "bottom": ["남성 바지", "남성 데님", "남성 슬랙스"],
+            "bag": ["남성 가방", "남성 백팩", "남성 크로스백"],
         }
 
     def _fallback_items_for_category(self, category: str, needed: int) -> list[CatalogItemRecord]:
@@ -1425,7 +1522,7 @@ class JobService:
                         image_url=image_url,
                         price=price,
                         gender=self._infer_item_gender(
-                            product_name=product_name,
+                            product_name=f"{product_name} {product_url}",
                             brand=str(row.get("brandName") or row.get("brand") or "MUSINSA"),
                             raw_gender=str(row.get("sex") or row.get("gender") or ""),
                         ),
@@ -1489,7 +1586,7 @@ class JobService:
                 product_url=product_url,
                 image_url=image_url,
                 price=self._extract_price(anchor.get_text(" ", strip=True)),
-                gender=self._infer_item_gender(product_name=product_name, brand="MUSINSA"),
+                gender=self._infer_item_gender(product_name=f"{product_name} {product_url}", brand="MUSINSA"),
                 embedding=[],
             )
             records.append(record)
@@ -1562,12 +1659,35 @@ class JobService:
         return target_gender == item_gender
 
     @staticmethod
+    def _contains_any_token(text: str, tokens: list[str]) -> bool:
+        normalized = (text or "").lower()
+        for token in tokens:
+            token_norm = token.lower()
+            if re.fullmatch(r"[a-z0-9 _-]+", token_norm):
+                if re.search(rf"(?<![a-z0-9]){re.escape(token_norm)}(?![a-z0-9])", normalized):
+                    return True
+            elif token_norm in normalized:
+                return True
+        return False
+
+    @staticmethod
+    def _has_opposite_gender_cue(target_gender: TargetGender, text: str) -> bool:
+        normalized = (text or "").lower()
+        has_men = JobService._contains_any_token(normalized, GENDER_MEN_TOKENS)
+        has_women = JobService._contains_any_token(normalized, GENDER_WOMEN_TOKENS)
+        if target_gender == TargetGender.men:
+            return has_women and not has_men
+        if target_gender == TargetGender.women:
+            return has_men and not has_women
+        return False
+
+    @staticmethod
     def _infer_item_gender(product_name: str, brand: str = "", raw_gender: str = "") -> TargetGender:
         raw = f"{raw_gender} {brand} {product_name}".lower()
-        men_tokens = ["남성", "남자", "맨즈", "men", "man", "mens", "male", "boy"]
-        women_tokens = ["여성", "여자", "우먼", "우먼즈", "women", "woman", "womens", "female", "girl", "lady"]
-        has_men = any(token in raw for token in men_tokens)
-        has_women = any(token in raw for token in women_tokens)
+        if JobService._contains_any_token(raw, GENDER_UNISEX_TOKENS):
+            return TargetGender.unisex
+        has_men = JobService._contains_any_token(raw, GENDER_MEN_TOKENS)
+        has_women = JobService._contains_any_token(raw, GENDER_WOMEN_TOKENS)
         if has_men and not has_women:
             return TargetGender.men
         if has_women and not has_men:
@@ -1577,11 +1697,54 @@ class JobService:
     def _effective_item_gender(self, item: CatalogItemRecord) -> TargetGender:
         if item.gender != TargetGender.unisex:
             return item.gender
-        inferred = self._infer_item_gender(item.product_name, item.brand)
+        inferred = self._infer_item_gender(f"{item.product_name} {item.product_url}", item.brand)
         return inferred
 
     @staticmethod
-    def _color_similarity_score(query_rgb: list[float], item_name: str) -> float:
+    def _attribute_compatibility_score(
+        query_sig: Optional[tuple[list[float], float, float]],
+        item_name: str,
+        category: str,
+    ) -> float:
+        text = (item_name or "").lower()
+        if not query_sig:
+            return 0.7
+        _, sat, edge = query_sig
+        plain_query = sat <= 0.38 and edge <= 0.17
+        score = 1.0
+        if plain_query and JobService._contains_any_token(text, PATTERN_TOKENS):
+            score *= 0.35
+        if plain_query and JobService._contains_any_token(text, DETAIL_TOKENS):
+            score *= 0.72
+        if category == "top" and JobService._contains_any_token(text, ["bra", "뷔스티에", "cami", "캐미", "camisole"]):
+            score *= 0.2
+        return max(0.05, min(1.0, score))
+
+    @staticmethod
+    def _target_gender_style_penalty(target_gender: TargetGender, category: str, item_name: str) -> float:
+        if target_gender == TargetGender.unisex:
+            return 1.0
+        text = (item_name or "").lower()
+        penalty = 1.0
+        if target_gender == TargetGender.men:
+            if category == "top":
+                if JobService._contains_any_token(
+                    text,
+                    ["crop", "크롭", "bra", "브라", "bustier", "뷔스티에", "cami", "camisole", "레이스", "lace"],
+                ):
+                    penalty *= 0.15
+                if JobService._contains_any_token(text, ["v-neck", "브이넥", "헨리넥", "henley"]):
+                    penalty *= 0.55
+            if category == "bottom":
+                if JobService._contains_any_token(text, ["leopard", "호피", "floral", "flower", "플라워", "스커트", "skirt"]):
+                    penalty *= 0.20
+        if target_gender == TargetGender.women:
+            if category == "top" and JobService._contains_any_token(text, ["oversized workwear", "work jacket"]):
+                penalty *= 0.75
+        return max(0.05, min(1.0, penalty))
+
+    @staticmethod
+    def _color_similarity_score(query_rgb: list[float], item_name: str, item_rgb: Optional[list[float]] = None) -> float:
         if not query_rgb or len(query_rgb) != 3:
             return 0.6
         palette = {
@@ -1622,26 +1785,30 @@ class JobService:
         }
         name = item_name.lower()
         item_colors = [canonical for token, canonical in aliases.items() if token in name]
-        if not item_colors:
+        if not item_colors and (not item_rgb or len(item_rgb) != 3):
             return 0.65
 
         def color_dist(a: list[float], b: list[float]) -> float:
             return math.sqrt(sum((x - y) * (x - y) for x, y in zip(a, b)))
 
-        r, g, b = query_rgb
-        brightness = (r + g + b) / 3.0
-        if brightness < 0.26:
-            # Dark tone disambiguation: navy tends to keep blue channel dominant.
-            if b > (r + 0.015) and b > (g + 0.012):
-                closest = "navy"
-            elif abs(r - g) < 0.03 and abs(g - b) < 0.03:
-                closest = "black"
-            else:
-                closest = min(palette.items(), key=lambda kv: color_dist(query_rgb, kv[1]))[0]
+        def closest_palette(rgb: list[float]) -> str:
+            r, g, b = rgb
+            brightness = (r + g + b) / 3.0
+            if brightness < 0.26:
+                if b > (r + 0.015) and b > (g + 0.012):
+                    return "navy"
+                if abs(r - g) < 0.03 and abs(g - b) < 0.03:
+                    return "black"
+            return min(palette.items(), key=lambda kv: color_dist(rgb, kv[1]))[0]
+
+        closest = closest_palette(query_rgb)
+        item_palette = closest_palette(item_rgb) if item_rgb and len(item_rgb) == 3 else None
+        if item_palette is None and item_colors:
+            item_palette = item_colors[0]
+        if item_palette == closest:
+            class_score = 1.0
         else:
-            closest = min(palette.items(), key=lambda kv: color_dist(query_rgb, kv[1]))[0]
-        if closest in item_colors:
-            return 1.0
+            class_score = 0.2
         neighborhood = {
             "navy": {"blue"},
             "blue": {"navy"},
@@ -1652,9 +1819,21 @@ class JobService:
             "gray": {"black", "white"},
             "white": {"gray"},
         }
-        if any(color in neighborhood.get(closest, set()) for color in item_colors):
-            return 0.75
-        return 0.20
+        if item_palette and item_palette in neighborhood.get(closest, set()):
+            class_score = max(class_score, 0.75)
+        if item_colors and closest in item_colors:
+            class_score = max(class_score, 0.92)
+        if item_colors and closest not in item_colors:
+            class_score *= 0.60
+            if closest in {"navy", "brown"} and ("black" in item_colors or "gray" in item_colors):
+                class_score *= 0.75
+        if item_rgb and len(item_rgb) == 3:
+            rgb_score = max(0.0, min(1.0, 1.0 - (color_dist(query_rgb, item_rgb) / math.sqrt(3.0))))
+        elif item_palette:
+            rgb_score = max(0.0, min(1.0, 1.0 - (color_dist(query_rgb, palette[item_palette]) / math.sqrt(3.0))))
+        else:
+            rgb_score = 0.6
+        return (0.55 * class_score) + (0.45 * rgb_score)
 
     def _embedding_from_text(self, text: str) -> list[float]:
         if not text:
@@ -1697,7 +1876,7 @@ class JobService:
                 # Drop near-white background and very dark noise.
                 if r > 245 and g > 245 and b > 245:
                     continue
-                if r < 10 and g < 10 and b < 10:
+                if r < 28 and g < 28 and b < 28:
                     continue
                 weighted.append((center_weight, (r, g, b), s))
         if not weighted:
@@ -1764,10 +1943,10 @@ class JobService:
 
                 out: dict[str, tuple[list[float], float, float]] = {}
                 out["global"] = self._style_signature_from_image(rgb)
-                out["top"] = self._style_signature_from_image(rgb.crop(crop_box(0.10, 0.05, 0.90, 0.45)))
-                out["bottom"] = self._style_signature_from_image(rgb.crop(crop_box(0.12, 0.45, 0.88, 0.82)))
+                out["top"] = self._style_signature_from_image(rgb.crop(crop_box(0.10, 0.05, 0.90, 0.46)))
+                out["bottom"] = self._style_signature_from_image(rgb.crop(crop_box(0.16, 0.40, 0.84, 0.78)))
                 out["outer"] = self._style_signature_from_image(rgb.crop(crop_box(0.06, 0.02, 0.94, 0.60)))
-                out["shoes"] = self._style_signature_from_image(rgb.crop(crop_box(0.15, 0.82, 0.85, 0.99)))
+                out["shoes"] = self._style_signature_from_image(rgb.crop(crop_box(0.15, 0.80, 0.85, 0.99)))
                 left_sig = self._style_signature_from_image(rgb.crop(crop_box(0.00, 0.25, 0.38, 0.80)))
                 right_sig = self._style_signature_from_image(rgb.crop(crop_box(0.62, 0.25, 1.00, 0.80)))
                 bag_rgb = [(a + b) / 2.0 for a, b in zip(left_sig[0], right_sig[0])]
