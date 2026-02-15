@@ -38,7 +38,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Ensure scripts are executable
-        run: chmod +x scripts/preflight-port.sh scripts/compose-smoke.sh scripts/classify-compose-flake.sh
+        run: chmod +x scripts/preflight-port.sh scripts/compose-smoke.sh scripts/classify-compose-flake.sh scripts/test-classify-compose-flake.sh
+      - name: Verify flake classifier regression rules
+        run: ./scripts/test-classify-compose-flake.sh
       - name: Run compose smoke repeatedly
         run: |
           mkdir -p artifacts

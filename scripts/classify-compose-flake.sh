@@ -26,7 +26,7 @@ fi
 classification="UNKNOWN"
 reason="no matching rule"
 
-if grep -Eq "port [0-9]+ is already in use|address already in use|bind: address already in use" <<< "$lc_log"; then
+if grep -Eq "port [0-9]+ is already in use|address already in use|bind: address already in use|port is already allocated|already allocated" <<< "$lc_log"; then
   classification="PORT_CONFLICT"
   reason="detected already-in-use port/bind failure"
 elif grep -Eq "health check failed|timed out|timeout|unhealthy|context deadline exceeded" <<< "$lc_log"; then

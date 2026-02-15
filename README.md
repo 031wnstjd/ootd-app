@@ -96,6 +96,8 @@ npm run build
   - `compose-ps.txt`
   - `compose-flake-classification.txt` (1차 원인 라벨)
 - 수동 실행(`workflow_dispatch`)에서 `smoke_runs` 입력으로 반복 횟수 조정 가능
+- CI에서 분류 규칙 회귀 테스트 수행:
+  - `./scripts/test-classify-compose-flake.sh`
 
 ## Permission Recovery (`EACCES`)
 
