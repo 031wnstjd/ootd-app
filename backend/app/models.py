@@ -40,6 +40,13 @@ class YouTubeUploadStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class CrawlJobStatus(str, Enum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
 class ScoreBreakdown(BaseModel):
     image: float
     text: float
@@ -114,6 +121,33 @@ class PublishResponse(BaseModel):
     youtube_video_id: str
     youtube_url: str
     youtube_upload_status: YouTubeUploadStatus
+
+
+class CatalogCrawlJobResponse(BaseModel):
+    crawl_job_id: UUID
+    status: CrawlJobStatus
+
+
+class CatalogCrawlJobDetailResponse(BaseModel):
+    crawl_job_id: UUID
+    status: CrawlJobStatus
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    total_discovered: int = 0
+    total_indexed: int = 0
+    error_message: Optional[str] = None
+
+
+class CatalogStatsResponse(BaseModel):
+    total_products: int
+    total_indexed_products: int
+    categories: dict[str, int] = Field(default_factory=dict)
+    last_crawl_completed_at: Optional[datetime] = None
+
+
+class CatalogIndexRebuildResponse(BaseModel):
+    total_products: int
+    total_indexed_products: int
 
 
 class HealthResponse(BaseModel):

@@ -1,5 +1,9 @@
 import {
   ApproveResponse,
+  CatalogCrawlJobDetailResponse,
+  CatalogCrawlJobResponse,
+  CatalogIndexRebuildResponse,
+  CatalogStatsResponse,
   CreateJobInput,
   CreateJobResponse,
   HistoryResponse,
@@ -96,6 +100,27 @@ export async function listHistory(limit = 20): Promise<HistoryResponse> {
 
 export async function getMetrics(): Promise<MetricsResponse> {
   return request<MetricsResponse>('/v1/metrics');
+}
+
+export async function startCatalogCrawl(limitPerCategory = 30): Promise<CatalogCrawlJobResponse> {
+  const params = new URLSearchParams({ limit_per_category: String(limitPerCategory) });
+  return request<CatalogCrawlJobResponse>(`/v1/catalog/crawl/jobs?${params.toString()}`, {
+    method: 'POST'
+  });
+}
+
+export async function getCatalogCrawlJob(crawlJobId: string): Promise<CatalogCrawlJobDetailResponse> {
+  return request<CatalogCrawlJobDetailResponse>(`/v1/catalog/crawl/jobs/${crawlJobId}`);
+}
+
+export async function rebuildCatalogIndex(): Promise<CatalogIndexRebuildResponse> {
+  return request<CatalogIndexRebuildResponse>('/v1/catalog/index/rebuild', {
+    method: 'POST'
+  });
+}
+
+export async function getCatalogStats(): Promise<CatalogStatsResponse> {
+  return request<CatalogStatsResponse>('/v1/catalog/stats');
 }
 
 export function toApiErrorMessage(err: unknown): string {

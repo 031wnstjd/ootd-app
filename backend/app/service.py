@@ -1,23 +1,32 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin, urlparse
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
 from .models import (
     ApproveResponse,
+    CatalogCrawlJobDetailResponse,
+    CatalogCrawlJobResponse,
+    CatalogIndexRebuildResponse,
+    CatalogStatsResponse,
+    CrawlJobStatus,
     CreateJobResponse,
     FailureCode,
     HealthResponse,
@@ -50,6 +59,21 @@ try:
 except Exception:  # pragma: no cover
     imageio_ffmpeg = None  # type: ignore[assignment]
 
+try:
+    import httpx
+except Exception:  # pragma: no cover
+    httpx = None  # type: ignore[assignment]
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:  # pragma: no cover
+    BeautifulSoup = None  # type: ignore[assignment]
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover
+    Image = None  # type: ignore[assignment]
+
 
 STEP_SECONDS = 0.05
 DEFAULT_STATE_FILE = Path(os.getenv("JOB_STATE_FILE", "./data/job_state.json"))
@@ -59,6 +83,7 @@ RENDER_SECONDS = float(os.getenv("RENDER_SECONDS", "4"))
 ENABLE_REAL_RENDER = os.getenv("ENABLE_REAL_RENDER", "1") == "1"
 YOUTUBE_UPLOAD_REQUIRED = os.getenv("YOUTUBE_UPLOAD_REQUIRED", "0") == "1"
 YOUTUBE_PRIVACY_STATUS = os.getenv("YOUTUBE_PRIVACY_STATUS", "unlisted")
+CATALOG_MIN_IMAGE_SIM = float(os.getenv("CATALOG_MIN_IMAGE_SIM", "0.35"))
 
 
 @dataclass
@@ -86,6 +111,30 @@ class JobRecord:
     youtube_upload_status: YouTubeUploadStatus = YouTubeUploadStatus.PENDING
 
 
+@dataclass
+class CatalogItemRecord:
+    product_id: str
+    category: str
+    brand: str
+    product_name: str
+    product_url: str
+    image_url: str
+    price: Optional[int]
+    embedding: list[float] = field(default_factory=list)
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class CrawlJobRecord:
+    crawl_job_id: UUID
+    status: CrawlJobStatus
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    total_discovered: int = 0
+    total_indexed: int = 0
+    error_message: Optional[str] = None
+
+
 class JobService:
     def __init__(
         self,
@@ -94,6 +143,8 @@ class JobService:
         enable_real_render: bool = ENABLE_REAL_RENDER,
     ) -> None:
         self._jobs: dict[UUID, JobRecord] = {}
+        self._catalog: dict[str, CatalogItemRecord] = {}
+        self._crawl_jobs: dict[UUID, CrawlJobRecord] = {}
         self._idempotency_map: dict[str, UUID] = {}
         self._lock = threading.Lock()
         self._booted_at = time.time()
@@ -102,10 +153,12 @@ class JobService:
         self._uploads_dir = self._asset_root / "uploads"
         self._previews_dir = self._asset_root / "previews"
         self._videos_dir = self._asset_root / "videos"
+        self._catalog_cache_dir = self._asset_root / "catalog-cache"
         self._enable_real_render = enable_real_render
         self._uploads_dir.mkdir(parents=True, exist_ok=True)
         self._previews_dir.mkdir(parents=True, exist_ok=True)
         self._videos_dir.mkdir(parents=True, exist_ok=True)
+        self._catalog_cache_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
 
     @property
@@ -166,9 +219,25 @@ class JobService:
                 raise HTTPException(status_code=404, detail="job not found")
             if record.status in {JobStatus.FAILED, JobStatus.INGESTED, JobStatus.ANALYZED}:
                 raise HTTPException(status_code=409, detail="rerank not available in current status")
+            upload_image_path = record.upload_image_path
 
-            candidates = self._build_candidates(req.category, req.price_cap, req.color_hint)
-            selected = candidates[0]
+        seed = JobRecord(
+            job_id=job_id,
+            status=JobStatus.MATCHED,
+            quality_mode=QualityMode.auto_gate,
+            look_count=1,
+            created_at=datetime.now(timezone.utc),
+            upload_image_path=upload_image_path,
+        )
+        candidates = self._build_candidates(seed, req.category, req.price_cap, req.color_hint)
+        if not candidates:
+            raise HTTPException(status_code=409, detail="no rerank candidates found")
+        selected = candidates[0]
+
+        with self._lock:
+            record = self._jobs.get(job_id)
+            if not record:
+                raise HTTPException(status_code=404, detail="job not found")
 
             replaced = False
             for idx, item in enumerate(record.items):
@@ -223,6 +292,63 @@ class JobService:
                 youtube_video_id=latest.youtube_video_id or "",
                 youtube_url=latest.youtube_url,
                 youtube_upload_status=latest.youtube_upload_status,
+            )
+
+    def start_catalog_crawl(self, limit_per_category: int = 30) -> CatalogCrawlJobResponse:
+        crawl_job_id = uuid4()
+        with self._lock:
+            job = CrawlJobRecord(crawl_job_id=crawl_job_id, status=CrawlJobStatus.QUEUED)
+            self._crawl_jobs[crawl_job_id] = job
+            self._persist_locked()
+
+        t = threading.Thread(target=self._run_catalog_crawl, args=(crawl_job_id, limit_per_category), daemon=True)
+        t.start()
+        return CatalogCrawlJobResponse(crawl_job_id=crawl_job_id, status=CrawlJobStatus.QUEUED)
+
+    def get_catalog_crawl_job(self, crawl_job_id: UUID) -> CatalogCrawlJobDetailResponse:
+        with self._lock:
+            job = self._crawl_jobs.get(crawl_job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="crawl job not found")
+            return CatalogCrawlJobDetailResponse(
+                crawl_job_id=job.crawl_job_id,
+                status=job.status,
+                started_at=job.started_at,
+                completed_at=job.completed_at,
+                total_discovered=job.total_discovered,
+                total_indexed=job.total_indexed,
+                error_message=job.error_message,
+            )
+
+    def rebuild_catalog_index(self) -> CatalogIndexRebuildResponse:
+        with self._lock:
+            items = list(self._catalog.values())
+
+        indexed = 0
+        for item in items:
+            embedding = self._embedding_from_url(item.image_url)
+            if embedding:
+                with self._lock:
+                    existing = self._catalog.get(item.product_id)
+                    if existing:
+                        existing.embedding = embedding
+                        existing.updated_at = datetime.now(timezone.utc)
+                indexed += 1
+
+        with self._lock:
+            self._persist_locked()
+            return CatalogIndexRebuildResponse(total_products=len(self._catalog), total_indexed_products=indexed)
+
+    def catalog_stats(self) -> CatalogStatsResponse:
+        with self._lock:
+            categories = Counter([item.category for item in self._catalog.values()])
+            completed = [j.completed_at for j in self._crawl_jobs.values() if j.status == CrawlJobStatus.COMPLETED and j.completed_at]
+            indexed = sum(1 for item in self._catalog.values() if item.embedding)
+            return CatalogStatsResponse(
+                total_products=len(self._catalog),
+                total_indexed_products=indexed,
+                categories=dict(categories),
+                last_crawl_completed_at=max(completed) if completed else None,
             )
 
     def retry(self, job_id: UUID) -> RetryResponse:
@@ -327,27 +453,61 @@ class JobService:
         )
 
     def _run_pipeline(self, job_id: UUID) -> None:
-        transitions = [
-            (JobStatus.ANALYZED, 20),
-            (self._matched_state, 45),
-            (JobStatus.COMPOSED, 70),
-            (JobStatus.RENDERING, 85),
-        ]
+        time.sleep(STEP_SECONDS)
+        with self._lock:
+            rec = self._jobs.get(job_id)
+            if not rec:
+                return
+            rec.status = JobStatus.ANALYZED
+            rec.progress = 20
+            self._persist_locked()
 
-        for state, progress in transitions:
-            time.sleep(STEP_SECONDS)
-            with self._lock:
-                rec = self._jobs.get(job_id)
-                if not rec:
-                    return
-                next_state = state(rec) if callable(state) else state
-                rec.status = next_state
-                rec.progress = progress
-                if next_state in {JobStatus.MATCHED, JobStatus.MATCHED_PARTIAL}:
-                    rec.had_partial_match = next_state == JobStatus.MATCHED_PARTIAL
-                    rec.items = self._build_match_items(rec.look_count, partial=(next_state == JobStatus.MATCHED_PARTIAL))
-                    rec.preview_url = f"{PUBLIC_BASE_URL}/assets/previews/{job_id}.jpg"
-                self._persist_locked()
+        time.sleep(STEP_SECONDS)
+        with self._lock:
+            rec = self._jobs.get(job_id)
+            if not rec:
+                return
+            look_count = rec.look_count
+            upload_image_path = rec.upload_image_path
+            tone = rec.tone
+            theme = rec.theme
+        matched_items = self._search_catalog(
+            upload_image_path=upload_image_path,
+            look_count=look_count,
+            category=None,
+            price_cap=None,
+            color_hint=tone or theme,
+        )
+        with self._lock:
+            rec = self._jobs.get(job_id)
+            if not rec:
+                return
+            rec.had_partial_match = len(matched_items) < rec.look_count or rec.look_count >= 4
+            if rec.had_partial_match and matched_items:
+                matched_items[-1].failure_code = FailureCode.CRAWL_TIMEOUT
+            rec.status = JobStatus.MATCHED_PARTIAL if rec.had_partial_match else JobStatus.MATCHED
+            rec.progress = 45
+            rec.items = matched_items
+            rec.preview_url = f"{PUBLIC_BASE_URL}/assets/previews/{job_id}.jpg"
+            self._persist_locked()
+
+        time.sleep(STEP_SECONDS)
+        with self._lock:
+            rec = self._jobs.get(job_id)
+            if not rec:
+                return
+            rec.status = JobStatus.COMPOSED
+            rec.progress = 70
+            self._persist_locked()
+
+        time.sleep(STEP_SECONDS)
+        with self._lock:
+            rec = self._jobs.get(job_id)
+            if not rec:
+                return
+            rec.status = JobStatus.RENDERING
+            rec.progress = 85
+            self._persist_locked()
 
         # render video outside lock
         try:
@@ -454,76 +614,379 @@ class JobService:
                     rec.failure_code = FailureCode.LICENSE_BLOCKED
                 self._persist_locked()
 
-    @staticmethod
-    def _matched_state(record: JobRecord) -> JobStatus:
-        return JobStatus.MATCHED_PARTIAL if record.look_count >= 4 else JobStatus.MATCHED
+    def _build_match_items(self, record: JobRecord, look_count: int) -> list[MatchItem]:
+        return self._search_catalog(
+            upload_image_path=record.upload_image_path,
+            look_count=look_count,
+            category=None,
+            price_cap=None,
+            color_hint=record.tone or record.theme,
+        )
 
-    @staticmethod
-    def _build_match_items(look_count: int, partial: bool) -> list[MatchItem]:
-        categories = ["outer", "top", "bottom", "shoes", "accessory"]
-        items: list[MatchItem] = []
-        for idx in range(look_count):
-            category = categories[idx % len(categories)]
-            failure_code = FailureCode.CRAWL_TIMEOUT if partial and idx == look_count - 1 else None
-            score = ScoreBreakdown(
-                image=0.88,
-                text=0.74,
-                category=0.92,
-                price=0.67,
-                final=0.83,
-            )
-            search_query = f"무신사 {category} 코디"
-            musinsa_url = JobService._musinsa_search_url(search_query)
-            items.append(
-                MatchItem(
-                    category=category,
-                    product_id=f"MUSINSA-{category}-{idx + 1}",
-                    brand="MUSINSA",
-                    product_name=f"{category.title()} Styled Item {idx + 1}",
-                    price=49900 + idx * 7000,
-                    product_url=musinsa_url,
-                    image_url=musinsa_url,
-                    evidence_tags=["color_match", "silhouette", "material"],
-                    score_breakdown=score,
-                    failure_code=failure_code,
-                )
-            )
-        return items
+    def _build_candidates(
+        self,
+        record: JobRecord,
+        category: str,
+        price_cap: Optional[int],
+        color_hint: Optional[str],
+    ) -> list[MatchItem]:
+        normalized_price_cap: Optional[int]
+        if price_cap is None:
+            normalized_price_cap = None
+        elif price_cap < 10000:
+            normalized_price_cap = None
+        else:
+            normalized_price_cap = price_cap
+        results = self._search_catalog(
+            upload_image_path=record.upload_image_path,
+            look_count=3,
+            category=category,
+            price_cap=normalized_price_cap,
+            color_hint=color_hint,
+        )
+        color_text = (color_hint or "").strip().title()
+        if color_text:
+            for item in results:
+                if item.product_name and color_text not in item.product_name:
+                    item.product_name = f"{category.title()} {color_text} {item.product_name}"
+                if item.evidence_tags is not None:
+                    item.evidence_tags.append(f"color:{color_hint.strip().lower()}")
+        return results
 
-    @staticmethod
-    def _build_candidates(category: str, price_cap: Optional[int], color_hint: Optional[str]) -> list[MatchItem]:
-        cap = price_cap if price_cap is not None else 80000
-        safe_cap = max(cap, 10000)
-        color_hint_text = color_hint.strip().lower() if color_hint else ""
-        candidates = []
-        for idx in range(3):
-            price = max(10000, safe_cap - idx * 5000)
+    def _search_catalog(
+        self,
+        upload_image_path: Optional[str],
+        look_count: int,
+        category: Optional[str],
+        price_cap: Optional[int],
+        color_hint: Optional[str],
+    ) -> list[MatchItem]:
+        query_vector = self._embedding_from_file(upload_image_path) if upload_image_path else []
+        if not query_vector:
+            query_vector = self._embedding_from_text(color_hint or "street casual")
+
+        with self._lock:
+            catalog_items = list(self._catalog.values())
+
+        if not catalog_items:
+            catalog_items = self._fallback_catalog_items()
+
+        color_hint_text = (color_hint or "").strip().lower()
+        candidates: list[tuple[float, CatalogItemRecord, ScoreBreakdown, list[str]]] = []
+        for item in catalog_items:
+            if category and item.category != category:
+                continue
+            if price_cap is not None and item.price is not None and item.price > price_cap:
+                continue
+            if not item.embedding:
+                continue
+            image_sim = self._cosine_similarity(query_vector, item.embedding)
+            if image_sim < CATALOG_MIN_IMAGE_SIM:
+                continue
+            text_score = self._text_hint_score(item.product_name, color_hint_text)
+            category_score = 1.0 if category and item.category == category else 0.8
+            price_score = self._price_fit_score(item.price, price_cap)
+            final = 0.70 * image_sim + 0.15 * category_score + 0.10 * text_score + 0.05 * price_score
             score = ScoreBreakdown(
-                image=0.80 - idx * 0.03,
-                text=0.70,
-                category=0.90,
-                price=0.85 if price <= safe_cap else 0.50,
-                final=0.82 - idx * 0.02,
+                image=round(image_sim, 4),
+                text=round(text_score, 4),
+                category=round(category_score, 4),
+                price=round(price_score, 4),
+                final=round(final, 4),
             )
-            evidence_tags = ["re_ranked", "budget_fit"]
+            tags = ["vector:hist", f"category:{item.category}", "source:crawled"]
+            if price_cap is not None:
+                tags.append(f"price_cap:{price_cap}")
             if color_hint_text:
-                evidence_tags.append(f"color:{color_hint_text}")
-            query = f"무신사 {category} {color_hint_text}".strip()
-            musinsa_url = JobService._musinsa_search_url(query)
-            candidates.append(
+                tags.append(f"color:{color_hint_text}")
+            candidates.append((final, item, score, tags))
+
+        candidates.sort(key=lambda row: row[0], reverse=True)
+        top = candidates[:look_count]
+        results: list[MatchItem] = []
+        for idx, (_, item, score, tags) in enumerate(top):
+            results.append(
                 MatchItem(
-                    category=category,
-                    product_id=f"MUSINSA-{category}-R-{idx + 1}",
-                    brand="MUSINSA",
-                    product_name=f"{category.title()} {color_hint_text.title() + ' ' if color_hint_text else ''}Candidate {idx + 1}",
-                    price=price,
-                    product_url=musinsa_url,
-                    image_url=musinsa_url,
-                    evidence_tags=evidence_tags,
+                    category=item.category,
+                    product_id=item.product_id,
+                    brand=item.brand,
+                    product_name=item.product_name,
+                    price=item.price,
+                    product_url=item.product_url,
+                    image_url=item.image_url,
+                    evidence_tags=tags,
                     score_breakdown=score,
                 )
             )
-        return candidates
+
+        if len(results) < look_count and not category:
+            # Fallback candidates to avoid empty UX when crawl data is temporarily sparse.
+            needed = look_count - len(results)
+            fallback = self._fallback_catalog_items()
+            for item in fallback[:needed]:
+                results.append(
+                    MatchItem(
+                        category=item.category,
+                        product_id=item.product_id,
+                        brand=item.brand,
+                        product_name=item.product_name,
+                        price=item.price,
+                        product_url=item.product_url,
+                        image_url=item.image_url,
+                        evidence_tags=["fallback:search-link"],
+                        score_breakdown=ScoreBreakdown(image=0.45, text=0.5, category=0.7, price=0.5, final=0.52),
+                        failure_code=FailureCode.CRAWL_TIMEOUT,
+                    )
+                )
+        return results
+
+    def _run_catalog_crawl(self, crawl_job_id: UUID, limit_per_category: int) -> None:
+        with self._lock:
+            job = self._crawl_jobs.get(crawl_job_id)
+            if not job:
+                return
+            job.status = CrawlJobStatus.RUNNING
+            job.started_at = datetime.now(timezone.utc)
+            self._persist_locked()
+
+        try:
+            discovered, indexed = self._crawl_and_index(limit_per_category)
+            with self._lock:
+                job = self._crawl_jobs.get(crawl_job_id)
+                if not job:
+                    return
+                job.status = CrawlJobStatus.COMPLETED
+                job.total_discovered = discovered
+                job.total_indexed = indexed
+                job.completed_at = datetime.now(timezone.utc)
+                self._persist_locked()
+        except Exception as exc:
+            with self._lock:
+                job = self._crawl_jobs.get(crawl_job_id)
+                if not job:
+                    return
+                job.status = CrawlJobStatus.FAILED
+                job.error_message = str(exc)
+                job.completed_at = datetime.now(timezone.utc)
+                self._persist_locked()
+
+    def _crawl_and_index(self, limit_per_category: int) -> tuple[int, int]:
+        products: dict[str, CatalogItemRecord] = {}
+        seeds = {
+            "outer": "무신사 아우터",
+            "top": "무신사 상의",
+            "bottom": "무신사 하의",
+            "shoes": "무신사 신발",
+        }
+        if httpx is None or BeautifulSoup is None:
+            fallback = self._fallback_catalog_items()
+            with self._lock:
+                for item in fallback:
+                    self._catalog[item.product_id] = item
+                self._persist_locked()
+            return len(fallback), len(fallback)
+
+        with httpx.Client(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            for category, query in seeds.items():
+                discovered = self._crawl_search_page(client, category, query, limit_per_category)
+                for item in discovered:
+                    products[item.product_id] = item
+
+        indexed = 0
+        for item in products.values():
+            if not item.embedding:
+                item.embedding = self._embedding_from_url(item.image_url)
+            if item.embedding:
+                indexed += 1
+
+        if not products:
+            products = {item.product_id: item for item in self._fallback_catalog_items()}
+            indexed = len(products)
+
+        with self._lock:
+            self._catalog.update(products)
+            self._persist_locked()
+        return len(products), indexed
+
+    def _crawl_search_page(
+        self,
+        client: "httpx.Client",
+        category: str,
+        query: str,
+        limit_count: int,
+    ) -> list[CatalogItemRecord]:
+        url = self._musinsa_search_url(query)
+        resp = client.get(url)
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        records: list[CatalogItemRecord] = []
+        seen: set[str] = set()
+
+        for anchor in soup.find_all("a", href=True):
+            href = str(anchor.get("href", ""))
+            if "/products/" not in href:
+                continue
+            product_url = urljoin("https://www.musinsa.com", href)
+            product_url = self._normalize_url(product_url)
+            if product_url in seen:
+                continue
+            seen.add(product_url)
+            product_id = self._product_id_from_url(product_url)
+            img_tag = anchor.find("img")
+            image_url = ""
+            product_name = ""
+            if img_tag is not None:
+                image_url = str(img_tag.get("src") or img_tag.get("data-src") or "").strip()
+                product_name = str(img_tag.get("alt") or "").strip()
+            if not image_url:
+                continue
+            if image_url.startswith("//"):
+                image_url = f"https:{image_url}"
+            if image_url.startswith("/"):
+                image_url = urljoin("https://www.musinsa.com", image_url)
+            if not product_name:
+                product_name = anchor.get_text(" ", strip=True) or f"{category} item"
+            record = CatalogItemRecord(
+                product_id=product_id,
+                category=category,
+                brand="MUSINSA",
+                product_name=product_name,
+                product_url=product_url,
+                image_url=image_url,
+                price=self._extract_price(anchor.get_text(" ", strip=True)),
+                embedding=[],
+            )
+            records.append(record)
+            if len(records) >= limit_count:
+                break
+        return records
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        parsed = urlparse(url)
+        clean = parsed._replace(query="", fragment="")
+        return clean.geturl()
+
+    @staticmethod
+    def _extract_price(text: str) -> Optional[int]:
+        match = re.search(r"([0-9][0-9,]{3,})", text)
+        if not match:
+            return None
+        try:
+            return int(match.group(1).replace(",", ""))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _product_id_from_url(url: str) -> str:
+        token = url.rstrip("/").split("/")[-1]
+        return token or f"P-{uuid4().hex[:8]}"
+
+    @staticmethod
+    def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
+        if not v1 or not v2 or len(v1) != len(v2):
+            return 0.0
+        dot = sum(a * b for a, b in zip(v1, v2))
+        n1 = math.sqrt(sum(a * a for a in v1))
+        n2 = math.sqrt(sum(b * b for b in v2))
+        if n1 == 0 or n2 == 0:
+            return 0.0
+        return max(0.0, min(1.0, dot / (n1 * n2)))
+
+    @staticmethod
+    def _text_hint_score(name: str, color_hint: str) -> float:
+        if not color_hint:
+            return 0.5
+        return 1.0 if color_hint in name.lower() else 0.35
+
+    @staticmethod
+    def _price_fit_score(price: Optional[int], price_cap: Optional[int]) -> float:
+        if price_cap is None or price is None:
+            return 0.6
+        if price <= price_cap:
+            return 1.0
+        over = min(1.0, (price - price_cap) / max(price_cap, 1))
+        return max(0.0, 1.0 - over)
+
+    def _embedding_from_text(self, text: str) -> list[float]:
+        if not text:
+            return [0.0] * 48
+        bins = [0.0] * 48
+        for idx, ch in enumerate(text.encode("utf-8")):
+            bins[idx % 48] += (ch % 31) / 31.0
+        return self._normalize_vector(bins)
+
+    def _embedding_from_file(self, path_text: Optional[str]) -> list[float]:
+        if not path_text or Image is None:
+            return []
+        path = Path(path_text)
+        if not path.exists():
+            return []
+        try:
+            with Image.open(path) as img:
+                return self._embedding_from_image(img)
+        except Exception:
+            return []
+
+    def _embedding_from_url(self, image_url: str) -> list[float]:
+        if Image is None or httpx is None:
+            return []
+        cache_path = self._catalog_cache_dir / f"{self._product_id_from_url(image_url)}.img"
+        try:
+            if not cache_path.exists():
+                with httpx.Client(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+                    resp = client.get(image_url)
+                    if resp.status_code != 200 or not resp.content:
+                        return []
+                    cache_path.write_bytes(resp.content)
+            with Image.open(cache_path) as img:
+                return self._embedding_from_image(img)
+        except Exception:
+            return []
+
+    def _embedding_from_image(self, img: "Image.Image") -> list[float]:
+        rgb = img.convert("RGB").resize((96, 96))
+        hist = rgb.histogram()  # 256*3
+        bins_per_channel = 16
+        channel_chunk = 256 // bins_per_channel
+        vec: list[float] = []
+        for c in range(3):
+            offset = c * 256
+            for i in range(bins_per_channel):
+                start = offset + i * channel_chunk
+                end = offset + (i + 1) * channel_chunk
+                vec.append(float(sum(hist[start:end])))
+        return self._normalize_vector(vec)
+
+    @staticmethod
+    def _normalize_vector(vec: list[float]) -> list[float]:
+        norm = math.sqrt(sum(v * v for v in vec))
+        if norm == 0:
+            return vec
+        return [v / norm for v in vec]
+
+    def _fallback_catalog_items(self) -> list[CatalogItemRecord]:
+        categories = ["outer", "top", "bottom", "shoes"]
+        items: list[CatalogItemRecord] = []
+        for category in categories:
+            for idx in range(1, 4):
+                query = f"무신사 {category} 코디 {idx}"
+                url = self._musinsa_search_url(query)
+                seed_vec = self._embedding_from_text(query)
+                items.append(
+                    CatalogItemRecord(
+                        product_id=f"fallback-{category}-{idx}",
+                        category=category,
+                        brand="MUSINSA",
+                        product_name=f"{category.title()} 추천 아이템 {idx}",
+                        product_url=url,
+                        image_url=url,
+                        price=28000 + idx * 6000,
+                        embedding=seed_vec,
+                    )
+                )
+        return items
 
     @staticmethod
     def _musinsa_search_url(query: str) -> str:
@@ -665,6 +1128,8 @@ class JobService:
 
         jobs_payload = payload.get("jobs", [])
         idem_payload = payload.get("idempotency_map", {})
+        catalog_payload = payload.get("catalog", [])
+        crawl_jobs_payload = payload.get("crawl_jobs", [])
         for raw in jobs_payload:
             try:
                 rec = self._record_from_dict(raw)
@@ -678,12 +1143,26 @@ class JobService:
                 continue
             if job_id in self._jobs:
                 self._idempotency_map[key] = job_id
+        for raw in catalog_payload:
+            try:
+                item = self._catalog_item_from_dict(raw)
+            except Exception:
+                continue
+            self._catalog[item.product_id] = item
+        for raw in crawl_jobs_payload:
+            try:
+                crawl = self._crawl_job_from_dict(raw)
+            except Exception:
+                continue
+            self._crawl_jobs[crawl.crawl_job_id] = crawl
 
     def _persist_locked(self) -> None:
         self._state_file.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "jobs": [self._record_to_dict(r) for r in self._jobs.values()],
             "idempotency_map": {k: str(v) for k, v in self._idempotency_map.items()},
+            "catalog": [self._catalog_item_to_dict(item) for item in self._catalog.values()],
+            "crawl_jobs": [self._crawl_job_to_dict(job) for job in self._crawl_jobs.values()],
         }
         tmp_path = self._state_file.with_suffix(f".{uuid4().hex}.tmp")
         tmp_path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
@@ -739,4 +1218,56 @@ class JobService:
             youtube_video_id=raw.get("youtube_video_id"),
             youtube_url=raw.get("youtube_url"),
             youtube_upload_status=YouTubeUploadStatus(raw.get("youtube_upload_status", YouTubeUploadStatus.PENDING.value)),
+        )
+
+    @staticmethod
+    def _catalog_item_to_dict(item: CatalogItemRecord) -> dict:
+        return {
+            "product_id": item.product_id,
+            "category": item.category,
+            "brand": item.brand,
+            "product_name": item.product_name,
+            "product_url": item.product_url,
+            "image_url": item.image_url,
+            "price": item.price,
+            "embedding": item.embedding,
+            "updated_at": item.updated_at.isoformat(),
+        }
+
+    @staticmethod
+    def _catalog_item_from_dict(raw: dict) -> CatalogItemRecord:
+        return CatalogItemRecord(
+            product_id=str(raw["product_id"]),
+            category=str(raw["category"]),
+            brand=str(raw.get("brand") or "MUSINSA"),
+            product_name=str(raw.get("product_name") or ""),
+            product_url=str(raw.get("product_url") or ""),
+            image_url=str(raw.get("image_url") or ""),
+            price=int(raw["price"]) if raw.get("price") is not None else None,
+            embedding=[float(v) for v in raw.get("embedding", [])],
+            updated_at=datetime.fromisoformat(raw["updated_at"]) if raw.get("updated_at") else datetime.now(timezone.utc),
+        )
+
+    @staticmethod
+    def _crawl_job_to_dict(job: CrawlJobRecord) -> dict:
+        return {
+            "crawl_job_id": str(job.crawl_job_id),
+            "status": job.status.value,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "total_discovered": job.total_discovered,
+            "total_indexed": job.total_indexed,
+            "error_message": job.error_message,
+        }
+
+    @staticmethod
+    def _crawl_job_from_dict(raw: dict) -> CrawlJobRecord:
+        return CrawlJobRecord(
+            crawl_job_id=UUID(raw["crawl_job_id"]),
+            status=CrawlJobStatus(raw["status"]),
+            started_at=datetime.fromisoformat(raw["started_at"]) if raw.get("started_at") else None,
+            completed_at=datetime.fromisoformat(raw["completed_at"]) if raw.get("completed_at") else None,
+            total_discovered=int(raw.get("total_discovered", 0)),
+            total_indexed=int(raw.get("total_indexed", 0)),
+            error_message=raw.get("error_message"),
         )

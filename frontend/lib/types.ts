@@ -19,6 +19,7 @@ export type FailureCode =
   | 'LICENSE_BLOCKED';
 
 export type YouTubeUploadStatus = 'PENDING' | 'SKIPPED' | 'UPLOADED' | 'FAILED';
+export type CrawlJobStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
 
 export interface ScoreBreakdown {
   image: number;
@@ -115,6 +116,33 @@ export interface MetricsResponse {
   total_jobs_retried: number;
   avg_processing_seconds: number;
   total_youtube_uploaded: number;
+}
+
+export interface CatalogCrawlJobResponse {
+  crawl_job_id: string;
+  status: CrawlJobStatus;
+}
+
+export interface CatalogCrawlJobDetailResponse {
+  crawl_job_id: string;
+  status: CrawlJobStatus;
+  started_at?: string;
+  completed_at?: string;
+  total_discovered: number;
+  total_indexed: number;
+  error_message?: string;
+}
+
+export interface CatalogStatsResponse {
+  total_products: number;
+  total_indexed_products: number;
+  categories: Record<string, number>;
+  last_crawl_completed_at?: string;
+}
+
+export interface CatalogIndexRebuildResponse {
+  total_products: number;
+  total_indexed_products: number;
 }
 
 export interface CreateJobInput {

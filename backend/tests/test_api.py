@@ -405,6 +405,40 @@ def test_publish_endpoint_requires_youtube_credentials(client: TestClient, monke
     assert publish.status_code == 409
 
 
+def test_catalog_ops_endpoints(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_main.service, "_crawl_and_index", lambda limit: (8, 6))
+
+    started = client.post("/v1/catalog/crawl/jobs?limit_per_category=10")
+    assert started.status_code == 202
+    crawl_job_id = started.json()["crawl_job_id"]
+
+    detail = None
+    end = time.time() + 2
+    while time.time() < end:
+        res = client.get(f"/v1/catalog/crawl/jobs/{crawl_job_id}")
+        assert res.status_code == 200
+        detail = res.json()
+        if detail["status"] in {"COMPLETED", "FAILED"}:
+            break
+        time.sleep(0.02)
+    assert detail is not None
+    assert detail["status"] == "COMPLETED"
+    assert detail["total_discovered"] == 8
+    assert detail["total_indexed"] == 6
+
+    stats = client.get("/v1/catalog/stats")
+    assert stats.status_code == 200
+    stats_body = stats.json()
+    assert stats_body["total_products"] >= 0
+    assert stats_body["total_indexed_products"] >= 0
+
+    rebuild = client.post("/v1/catalog/index/rebuild")
+    assert rebuild.status_code == 200
+    rebuild_body = rebuild.json()
+    assert rebuild_body["total_products"] >= 0
+    assert rebuild_body["total_indexed_products"] >= 0
+
+
 def test_history_default_limit_and_valid_limit(client: TestClient) -> None:
     for _ in range(25):
         _create_job(client, quality_mode="auto_gate", look_count=1)

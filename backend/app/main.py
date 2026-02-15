@@ -8,6 +8,10 @@ from fastapi.staticfiles import StaticFiles
 
 from .models import (
     ApproveResponse,
+    CatalogCrawlJobDetailResponse,
+    CatalogCrawlJobResponse,
+    CatalogIndexRebuildResponse,
+    CatalogStatsResponse,
     CreateJobResponse,
     HealthResponse,
     HistoryResponse,
@@ -80,6 +84,30 @@ async def retry_job(job_id: UUID) -> RetryResponse:
 @app.post("/v1/jobs/{job_id}/publish", response_model=PublishResponse)
 async def publish_job(job_id: UUID) -> PublishResponse:
     return service.publish_youtube(job_id)
+
+
+@app.post("/v1/catalog/crawl/jobs", response_model=CatalogCrawlJobResponse, status_code=202)
+async def start_catalog_crawl(limit_per_category: int = 30) -> CatalogCrawlJobResponse:
+    if limit_per_category < 5:
+        limit_per_category = 5
+    if limit_per_category > 100:
+        limit_per_category = 100
+    return service.start_catalog_crawl(limit_per_category=limit_per_category)
+
+
+@app.get("/v1/catalog/crawl/jobs/{crawl_job_id}", response_model=CatalogCrawlJobDetailResponse)
+async def get_catalog_crawl_job(crawl_job_id: UUID) -> CatalogCrawlJobDetailResponse:
+    return service.get_catalog_crawl_job(crawl_job_id)
+
+
+@app.post("/v1/catalog/index/rebuild", response_model=CatalogIndexRebuildResponse)
+async def rebuild_catalog_index() -> CatalogIndexRebuildResponse:
+    return service.rebuild_catalog_index()
+
+
+@app.get("/v1/catalog/stats", response_model=CatalogStatsResponse)
+async def catalog_stats() -> CatalogStatsResponse:
+    return service.catalog_stats()
 
 
 @app.get("/v1/history", response_model=HistoryResponse)

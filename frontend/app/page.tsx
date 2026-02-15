@@ -4,15 +4,21 @@ import { FormEvent, useEffect, useMemo, useState } from 'react';
 import {
   approveJob,
   createJob,
+  getCatalogCrawlJob,
+  getCatalogStats,
   getMetrics,
   getJob,
   listHistory,
   publishJob,
+  rebuildCatalogIndex,
   rerankJob,
   retryJob,
+  startCatalogCrawl,
   toApiErrorMessage
 } from '@/lib/api';
 import {
+  CatalogCrawlJobDetailResponse,
+  CatalogStatsResponse,
   FailureCode,
   HistoryItem,
   JobDetailResponse,
@@ -129,6 +135,8 @@ export default function DashboardPage() {
   const [job, setJob] = useState<JobDetailResponse | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
+  const [catalogStats, setCatalogStats] = useState<CatalogStatsResponse | null>(null);
+  const [crawlJob, setCrawlJob] = useState<CatalogCrawlJobDetailResponse | null>(null);
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isRefreshingJob, setIsRefreshingJob] = useState(false);
@@ -136,6 +144,8 @@ export default function DashboardPage() {
   const [isApproving, setIsApproving] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
   const [isPublishing, setIsPublishing] = useState(false);
+  const [isCrawling, setIsCrawling] = useState(false);
+  const [isRebuilding, setIsRebuilding] = useState(false);
   const [rerankBusyCategory, setRerankBusyCategory] = useState<string>('');
   const [rerankPriceCapByCategory, setRerankPriceCapByCategory] = useState<Record<string, string>>({});
   const [rerankColorHintByCategory, setRerankColorHintByCategory] = useState<Record<string, string>>({});
@@ -145,6 +155,7 @@ export default function DashboardPage() {
   const [jobError, setJobError] = useState('');
   const [historyError, setHistoryError] = useState('');
   const [metricsError, setMetricsError] = useState('');
+  const [catalogError, setCatalogError] = useState('');
 
   const canApprove = job?.status === 'REVIEW_REQUIRED' && job.quality_mode === 'human_review';
   const isPolling = !!job?.status && ACTIVE_STATUSES.includes(job.status);
@@ -192,9 +203,20 @@ export default function DashboardPage() {
     }
   }
 
+  async function refreshCatalogStats() {
+    setCatalogError('');
+    try {
+      const stats = await getCatalogStats();
+      setCatalogStats(stats);
+    } catch (err) {
+      setCatalogError(toApiErrorMessage(err));
+    }
+  }
+
   useEffect(() => {
     void refreshHistory();
     void refreshMetrics();
+    void refreshCatalogStats();
   }, []);
 
   useEffect(() => {
@@ -372,6 +394,34 @@ export default function DashboardPage() {
       setJobError(toApiErrorMessage(err));
     } finally {
       setIsPublishing(false);
+    }
+  }
+
+  async function onStartCatalogCrawl() {
+    setCatalogError('');
+    setIsCrawling(true);
+    try {
+      const started = await startCatalogCrawl(30);
+      const detail = await getCatalogCrawlJob(started.crawl_job_id);
+      setCrawlJob(detail);
+      await refreshCatalogStats();
+    } catch (err) {
+      setCatalogError(toApiErrorMessage(err));
+    } finally {
+      setIsCrawling(false);
+    }
+  }
+
+  async function onRebuildCatalogIndex() {
+    setCatalogError('');
+    setIsRebuilding(true);
+    try {
+      await rebuildCatalogIndex();
+      await refreshCatalogStats();
+    } catch (err) {
+      setCatalogError(toApiErrorMessage(err));
+    } finally {
+      setIsRebuilding(false);
     }
   }
 
@@ -602,6 +652,51 @@ export default function DashboardPage() {
 
           {jobError && <p className="mt-3 text-sm text-bad">{jobError}</p>}
         </div>
+      </section>
+
+      <section className="mt-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-lg font-semibold">Catalog Retrieval Ops</h2>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => void onStartCatalogCrawl()}
+              disabled={isCrawling}
+              className="rounded-md border border-slate-300 px-3 py-1.5 text-sm disabled:opacity-50"
+            >
+              {isCrawling ? 'Crawling...' : 'Start Crawl'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void onRebuildCatalogIndex()}
+              disabled={isRebuilding}
+              className="rounded-md border border-slate-300 px-3 py-1.5 text-sm disabled:opacity-50"
+            >
+              {isRebuilding ? 'Rebuilding...' : 'Rebuild Index'}
+            </button>
+          </div>
+        </div>
+        {catalogStats ? (
+          <div className="grid grid-cols-2 gap-2 text-sm lg:grid-cols-4">
+            <p className="rounded bg-panel px-2 py-1">products: {catalogStats.total_products}</p>
+            <p className="rounded bg-panel px-2 py-1">indexed: {catalogStats.total_indexed_products}</p>
+            <p className="rounded bg-panel px-2 py-1">
+              categories: {Object.keys(catalogStats.categories ?? {}).length}
+            </p>
+            <p className="rounded bg-panel px-2 py-1">
+              last crawl: {catalogStats.last_crawl_completed_at ?? '-'}
+            </p>
+          </div>
+        ) : (
+          <p className="text-sm text-muted">No catalog stats yet.</p>
+        )}
+        {crawlJob && (
+          <p className="mt-2 text-sm text-muted">
+            crawl_job: {crawlJob.crawl_job_id} / status: {crawlJob.status} / discovered: {crawlJob.total_discovered} / indexed:{' '}
+            {crawlJob.total_indexed}
+          </p>
+        )}
+        {catalogError && <p className="mt-3 text-sm text-bad">{catalogError}</p>}
       </section>
 
       <section className="mt-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
