@@ -20,6 +20,7 @@ export type FailureCode =
 
 export type YouTubeUploadStatus = 'PENDING' | 'SKIPPED' | 'UPLOADED' | 'FAILED';
 export type CrawlJobStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+export type CrawlMode = 'incremental' | 'full';
 
 export interface ScoreBreakdown {
   image: number;
@@ -27,6 +28,15 @@ export interface ScoreBreakdown {
   category: number;
   price: number;
   final: number;
+  meta?: number;
+  roi_confidence?: number;
+  retrieval_rank?: number;
+}
+
+export interface RoiRegion {
+  category: string;
+  bbox: number[];
+  confidence: number;
 }
 
 export interface MatchItem {
@@ -63,6 +73,7 @@ export interface JobDetailResponse {
   youtube_video_id?: string;
   youtube_url?: string;
   youtube_upload_status?: YouTubeUploadStatus;
+  roi_debug?: Record<string, RoiRegion>;
 }
 
 export interface RerankRequest {
@@ -121,11 +132,13 @@ export interface MetricsResponse {
 export interface CatalogCrawlJobResponse {
   crawl_job_id: string;
   status: CrawlJobStatus;
+  mode: CrawlMode;
 }
 
 export interface CatalogCrawlJobDetailResponse {
   crawl_job_id: string;
   status: CrawlJobStatus;
+  mode: CrawlMode;
   started_at?: string;
   completed_at?: string;
   total_discovered: number;
@@ -137,7 +150,10 @@ export interface CatalogStatsResponse {
   total_products: number;
   total_indexed_products: number;
   categories: Record<string, number>;
+  per_category_indexed: Record<string, number>;
   last_crawl_completed_at?: string;
+  last_incremental_at?: string;
+  last_full_reindex_at?: string;
 }
 
 export interface CatalogIndexRebuildResponse {

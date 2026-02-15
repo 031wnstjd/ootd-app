@@ -13,7 +13,7 @@ import {
   rebuildCatalogIndex,
   rerankJob,
   retryJob,
-  startCatalogCrawl,
+  startCatalogCrawlWithMode,
   toApiErrorMessage
 } from '@/lib/api';
 import {
@@ -25,6 +25,7 @@ import {
   JobStatus,
   MatchItem,
   MetricsResponse,
+  RoiRegion,
   QualityMode,
   ScoreBreakdown
 } from '@/lib/types';
@@ -439,10 +440,14 @@ export default function DashboardPage() {
   }
 
   async function onStartCatalogCrawl() {
+    await onStartCatalogCrawlMode('incremental');
+  }
+
+  async function onStartCatalogCrawlMode(mode: 'incremental' | 'full') {
     setCatalogError('');
     setIsCrawling(true);
     try {
-      const started = await startCatalogCrawl(300);
+      const started = await startCatalogCrawlWithMode(1000, mode);
       const detail = await getCatalogCrawlJob(started.crawl_job_id);
       setCrawlJob(detail);
       await refreshCatalogStats();
@@ -707,14 +712,22 @@ export default function DashboardPage() {
             <div className="mb-4 flex items-center justify-between">
               <h3 className="text-base font-semibold">Catalog Retrieval Ops</h3>
           <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={() => void onStartCatalogCrawl()}
-              disabled={isCrawling}
-              className="rounded-md border border-slate-300 px-3 py-1.5 text-sm disabled:opacity-50"
-            >
-              {isCrawling ? 'Crawling...' : 'Start Crawl'}
-            </button>
+                <button
+                  type="button"
+                  onClick={() => void onStartCatalogCrawl()}
+                  disabled={isCrawling}
+                  className="rounded-md border border-slate-300 px-3 py-1.5 text-sm disabled:opacity-50"
+                >
+                  {isCrawling ? 'Crawling...' : 'Start Incremental Crawl'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void onStartCatalogCrawlMode('full')}
+                  disabled={isCrawling}
+                  className="rounded-md border border-slate-300 px-3 py-1.5 text-sm disabled:opacity-50"
+                >
+                  {isCrawling ? 'Crawling...' : 'Start Full Crawl'}
+                </button>
             <button
               type="button"
               onClick={() => void onRebuildCatalogIndex()}
@@ -735,13 +748,20 @@ export default function DashboardPage() {
             <p className="rounded bg-panel px-2 py-1">
               last crawl: {catalogStats.last_crawl_completed_at ?? '-'}
             </p>
+            <p className="rounded bg-panel px-2 py-1">
+              last incremental: {catalogStats.last_incremental_at ?? '-'}
+            </p>
+            <p className="rounded bg-panel px-2 py-1">
+              last full reindex: {catalogStats.last_full_reindex_at ?? '-'}
+            </p>
           </div>
         ) : (
           <p className="text-sm text-muted">No catalog stats yet.</p>
         )}
         {crawlJob && (
           <p className="mt-2 text-sm text-muted">
-            crawl_job: {crawlJob.crawl_job_id} / status: {crawlJob.status} / discovered: {crawlJob.total_discovered} / indexed:{' '}
+            crawl_job: {crawlJob.crawl_job_id} / mode: {crawlJob.mode} / status: {crawlJob.status} / discovered:{' '}
+            {crawlJob.total_discovered} / indexed:{' '}
             {crawlJob.total_indexed}
           </p>
         )}
@@ -788,6 +808,18 @@ export default function DashboardPage() {
 
         {job?.items?.length ? (
           <div className="space-y-6">
+            {job.roi_debug && Object.keys(job.roi_debug).length > 0 && (
+              <div className="rounded-md border border-slate-200 p-3">
+                <p className="mb-2 text-sm font-medium">ROI Debug</p>
+                <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+                  {Object.entries(job.roi_debug as Record<string, RoiRegion>).map(([key, roi]) => (
+                    <p key={key} className="rounded bg-panel px-2 py-1 text-xs">
+                      {key}: conf {formatScore(roi.confidence)} / bbox [{roi.bbox.map((v) => v.toFixed(2)).join(', ')}]
+                    </p>
+                  ))}
+                </div>
+              </div>
+            )}
             {[
               { key: 'top', title: '상의 추천', items: groupedItems.top },
               { key: 'bottom', title: '하의 추천', items: groupedItems.bottom },

@@ -40,6 +40,7 @@ docker compose up --build
 
 - Frontend: `http://localhost:3005`
 - Backend docs: `http://localhost:8000/docs`
+- Qdrant: `http://localhost:6333/dashboard`
 
 ### Port preflight
 
@@ -132,8 +133,19 @@ docker run --rm -v "$PWD":/work alpine sh -lc "chown -R $(id -u):$(id -g) /work/
 
 - 템플릿 고정 후보 대신 카탈로그(크롤링) 기반으로 후보를 검색합니다.
 - 상품 이미지 임베딩(히스토그램 기반)을 생성하여 업로드 이미지와 코사인 유사도로 랭킹합니다.
+- 가능하면 Qdrant 벡터 인덱스(`QDRANT_ENABLED=1`)에서 카테고리 기반 ANN 후보를 먼저 가져오고, 실패 시 메모리 스캔으로 fallback 합니다.
 - 카탈로그가 비어 있거나 외부 수집이 실패하면 검색 링크 기반 fallback 후보를 반환합니다.
 - `CATALOG_MIN_IMAGE_SIM` (default `0.35`)로 최소 이미지 유사도 임계값을 조정할 수 있습니다.
+- Job 상세 응답(`GET /v1/jobs/{job_id}`)에는 `roi_debug`가 포함되어 카테고리별 bbox/confidence를 확인할 수 있습니다.
+
+## Crawl Modes
+
+- `POST /v1/catalog/crawl/jobs?mode=incremental`:
+  - 기존 catalog를 유지한 채 신규/변경 데이터를 병합합니다.
+- `POST /v1/catalog/crawl/jobs?mode=full`:
+  - 기존 catalog를 재구성하고 벡터 인덱스도 전체 재동기화합니다.
+
+기본 mode는 `incremental`입니다.
 
 ## Export Crawled Images As JPG Dataset
 

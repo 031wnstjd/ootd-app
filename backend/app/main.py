@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .models import (
     ApproveResponse,
+    CrawlMode,
     CatalogCrawlJobDetailResponse,
     CatalogCrawlJobResponse,
     CatalogIndexRebuildResponse,
@@ -87,12 +88,12 @@ async def publish_job(job_id: UUID) -> PublishResponse:
 
 
 @app.post("/v1/catalog/crawl/jobs", response_model=CatalogCrawlJobResponse, status_code=202)
-async def start_catalog_crawl(limit_per_category: int = 300) -> CatalogCrawlJobResponse:
+async def start_catalog_crawl(limit_per_category: int = 300, mode: CrawlMode = CrawlMode.incremental) -> CatalogCrawlJobResponse:
     if limit_per_category < 300:
         limit_per_category = 300
     if limit_per_category > 1000:
         limit_per_category = 1000
-    return service.start_catalog_crawl(limit_per_category=limit_per_category)
+    return service.start_catalog_crawl(limit_per_category=limit_per_category, mode=mode)
 
 
 @app.get("/v1/catalog/crawl/jobs/{crawl_job_id}", response_model=CatalogCrawlJobDetailResponse)

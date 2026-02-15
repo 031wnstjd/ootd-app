@@ -103,7 +103,14 @@ export async function getMetrics(): Promise<MetricsResponse> {
 }
 
 export async function startCatalogCrawl(limitPerCategory = 300): Promise<CatalogCrawlJobResponse> {
-  const params = new URLSearchParams({ limit_per_category: String(limitPerCategory) });
+  return startCatalogCrawlWithMode(limitPerCategory, 'incremental');
+}
+
+export async function startCatalogCrawlWithMode(
+  limitPerCategory = 300,
+  mode: 'incremental' | 'full' = 'incremental'
+): Promise<CatalogCrawlJobResponse> {
+  const params = new URLSearchParams({ limit_per_category: String(limitPerCategory), mode });
   return request<CatalogCrawlJobResponse>(`/v1/catalog/crawl/jobs?${params.toString()}`, {
     method: 'POST'
   });

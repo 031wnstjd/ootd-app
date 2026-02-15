@@ -1,4 +1,11 @@
 services:
+  qdrant:
+    image: qdrant/qdrant:v1.13.4
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
   backend:
     image: python:3.12-slim
     working_dir: /app/backend
@@ -11,10 +18,15 @@ services:
       - ENABLE_REAL_RENDER=1
       - YOUTUBE_UPLOAD_REQUIRED=0
       - YOUTUBE_PRIVACY_STATUS=unlisted
+      - QDRANT_ENABLED=1
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=musinsa_catalog
     command: >
       bash -lc "pip install -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     ports:
       - "8000:8000"
+    depends_on:
+      - qdrant
 
   frontend:
     image: node:20-alpine
@@ -29,3 +41,6 @@ services:
       - "${FRONTEND_PORT:-3005}:${FRONTEND_PORT:-3005}"
     depends_on:
       - backend
+
+volumes:
+  qdrant_data:

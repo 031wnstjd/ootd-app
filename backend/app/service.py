@@ -23,6 +23,7 @@ from fastapi import HTTPException
 
 from .models import (
     ApproveResponse,
+    CrawlMode,
     CatalogCrawlJobDetailResponse,
     CatalogCrawlJobResponse,
     CatalogIndexRebuildResponse,
@@ -41,6 +42,7 @@ from .models import (
     QualityMode,
     RerankRequest,
     RerankResponse,
+    RoiRegion,
     RetryResponse,
     ScoreBreakdown,
     YouTubeUploadStatus,
@@ -76,6 +78,13 @@ except Exception:  # pragma: no cover
     Image = None  # type: ignore[assignment]
     ImageFilter = None  # type: ignore[assignment]
 
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.http import models as qdrant_models
+except Exception:  # pragma: no cover
+    QdrantClient = None  # type: ignore[assignment]
+    qdrant_models = None  # type: ignore[assignment]
+
 
 STEP_SECONDS = 0.05
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -96,6 +105,10 @@ CATALOG_DATASET_EXPORT_DIRS = os.getenv(
     "CATALOG_DATASET_EXPORT_DIRS",
     "datasets/catalog-jpg,data/datasets/catalog-jpg",
 )
+QDRANT_ENABLED = os.getenv("QDRANT_ENABLED", "1") == "1"
+QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "musinsa_catalog")
+QDRANT_TOPK_MULTIPLIER = int(os.getenv("QDRANT_TOPK_MULTIPLIER", "12"))
 
 
 @dataclass
@@ -121,6 +134,7 @@ class JobRecord:
     youtube_video_id: Optional[str] = None
     youtube_url: Optional[str] = None
     youtube_upload_status: YouTubeUploadStatus = YouTubeUploadStatus.PENDING
+    roi_debug: dict[str, RoiRegion] = field(default_factory=dict)
 
 
 @dataclass
@@ -140,6 +154,7 @@ class CatalogItemRecord:
 class CrawlJobRecord:
     crawl_job_id: UUID
     status: CrawlJobStatus
+    mode: CrawlMode
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     total_discovered: int = 0
@@ -168,6 +183,9 @@ class JobService:
         self._catalog_cache_dir = self._asset_root / "catalog-cache"
         self._dataset_export_dirs = self._parse_dataset_export_dirs(CATALOG_DATASET_EXPORT_DIRS)
         self._enable_real_render = enable_real_render
+        self._last_incremental_at: Optional[datetime] = None
+        self._last_full_reindex_at: Optional[datetime] = None
+        self._qdrant_client = self._init_qdrant_client()
         self._uploads_dir.mkdir(parents=True, exist_ok=True)
         self._previews_dir.mkdir(parents=True, exist_ok=True)
         self._videos_dir.mkdir(parents=True, exist_ok=True)
@@ -307,16 +325,16 @@ class JobService:
                 youtube_upload_status=latest.youtube_upload_status,
             )
 
-    def start_catalog_crawl(self, limit_per_category: int = 300) -> CatalogCrawlJobResponse:
+    def start_catalog_crawl(self, limit_per_category: int = 300, mode: CrawlMode = CrawlMode.incremental) -> CatalogCrawlJobResponse:
         crawl_job_id = uuid4()
         with self._lock:
-            job = CrawlJobRecord(crawl_job_id=crawl_job_id, status=CrawlJobStatus.QUEUED)
+            job = CrawlJobRecord(crawl_job_id=crawl_job_id, status=CrawlJobStatus.QUEUED, mode=mode)
             self._crawl_jobs[crawl_job_id] = job
             self._persist_locked()
 
-        t = threading.Thread(target=self._run_catalog_crawl, args=(crawl_job_id, limit_per_category), daemon=True)
+        t = threading.Thread(target=self._run_catalog_crawl, args=(crawl_job_id, limit_per_category, mode), daemon=True)
         t.start()
-        return CatalogCrawlJobResponse(crawl_job_id=crawl_job_id, status=CrawlJobStatus.QUEUED)
+        return CatalogCrawlJobResponse(crawl_job_id=crawl_job_id, status=CrawlJobStatus.QUEUED, mode=mode)
 
     def get_catalog_crawl_job(self, crawl_job_id: UUID) -> CatalogCrawlJobDetailResponse:
         with self._lock:
@@ -326,6 +344,7 @@ class JobService:
             return CatalogCrawlJobDetailResponse(
                 crawl_job_id=job.crawl_job_id,
                 status=job.status,
+                mode=job.mode,
                 started_at=job.started_at,
                 completed_at=job.completed_at,
                 total_discovered=job.total_discovered,
@@ -349,15 +368,18 @@ class JobService:
                         if existing:
                             existing.embedding = embedding
                             existing.updated_at = datetime.now(timezone.utc)
+                            self._upsert_qdrant_item(existing)
                     indexed += 1
 
         with self._lock:
+            self._last_full_reindex_at = datetime.now(timezone.utc)
             self._persist_locked()
             return CatalogIndexRebuildResponse(total_products=len(self._catalog), total_indexed_products=indexed)
 
     def catalog_stats(self) -> CatalogStatsResponse:
         with self._lock:
             categories = Counter([item.category for item in self._catalog.values()])
+            indexed_categories = Counter([item.category for item in self._catalog.values() if item.embedding])
             completed = [j.completed_at for j in self._crawl_jobs.values() if j.status == CrawlJobStatus.COMPLETED and j.completed_at]
             indexed = sum(1 for item in self._catalog.values() if item.embedding)
             return CatalogStatsResponse(
@@ -365,6 +387,9 @@ class JobService:
                 total_indexed_products=indexed,
                 categories=dict(categories),
                 last_crawl_completed_at=max(completed) if completed else None,
+                per_category_indexed=dict(indexed_categories),
+                last_incremental_at=self._last_incremental_at,
+                last_full_reindex_at=self._last_full_reindex_at,
             )
 
     def retry(self, job_id: UUID) -> RetryResponse:
@@ -466,6 +491,7 @@ class JobService:
             youtube_video_id=r.youtube_video_id,
             youtube_url=r.youtube_url,
             youtube_upload_status=r.youtube_upload_status,
+            roi_debug=r.roi_debug,
         )
 
     def _run_pipeline(self, job_id: UUID) -> None:
@@ -488,7 +514,7 @@ class JobService:
             tone = rec.tone
             theme = rec.theme
             effective_look_count = self._effective_auto_match_count(look_count, category=None)
-        matched_items = self._search_catalog(
+        matched_items, roi_debug = self._search_catalog(
             upload_image_path=upload_image_path,
             look_count=effective_look_count,
             category=None,
@@ -505,6 +531,7 @@ class JobService:
             rec.status = JobStatus.MATCHED_PARTIAL if rec.had_partial_match else JobStatus.MATCHED
             rec.progress = 45
             rec.items = matched_items
+            rec.roi_debug = roi_debug
             rec.preview_url = f"{PUBLIC_BASE_URL}/assets/previews/{job_id}.jpg"
             self._persist_locked()
 
@@ -634,13 +661,14 @@ class JobService:
                 self._persist_locked()
 
     def _build_match_items(self, record: JobRecord, look_count: int) -> list[MatchItem]:
-        return self._search_catalog(
+        items, _ = self._search_catalog(
             upload_image_path=record.upload_image_path,
             look_count=look_count,
             category=None,
             price_cap=None,
             color_hint=record.tone or record.theme,
         )
+        return items
 
     def _build_candidates(
         self,
@@ -656,7 +684,7 @@ class JobService:
             normalized_price_cap = None
         else:
             normalized_price_cap = price_cap
-        results = self._search_catalog(
+        results, _ = self._search_catalog(
             upload_image_path=record.upload_image_path,
             look_count=3,
             category=category,
@@ -679,12 +707,12 @@ class JobService:
         category: Optional[str],
         price_cap: Optional[int],
         color_hint: Optional[str],
-    ) -> list[MatchItem]:
+    ) -> tuple[list[MatchItem], dict[str, RoiRegion]]:
         effective_look_count = self._effective_auto_match_count(look_count, category)
-        query_vectors = self._query_vectors_by_category(upload_image_path)
+        query_vectors, roi_debug = self._query_vectors_by_category(upload_image_path)
         global_query_vector = query_vectors.get("global", [])
         if not global_query_vector:
-            return []
+            return [], roi_debug
 
         with self._lock:
             catalog_items = list(self._catalog.values())
@@ -694,7 +722,13 @@ class JobService:
 
         color_hint_text = (color_hint or "").strip().lower()
         candidates: list[tuple[float, CatalogItemRecord, ScoreBreakdown, list[str]]] = []
-        for item in catalog_items:
+        candidate_items = self._qdrant_search_candidates(
+            query_vectors=query_vectors,
+            fallback_items=catalog_items,
+            category=category,
+            limit=max(30, effective_look_count * QDRANT_TOPK_MULTIPLIER),
+        )
+        for item in candidate_items:
             if category and item.category != category:
                 continue
             if price_cap is not None and item.price is not None and item.price > price_cap:
@@ -709,16 +743,26 @@ class JobService:
             text_score = 0.0
             category_score = 1.0 if category and item.category == category else 0.8
             price_score = self._price_fit_score(item.price, price_cap)
-            final = image_sim if price_cap is None else (0.92 * image_sim + 0.08 * price_score)
+            meta_score = price_score
+            final = 0.95 * image_sim + 0.05 * meta_score
             score = ScoreBreakdown(
                 image=round(image_sim, 4),
                 text=round(text_score, 4),
                 category=round(category_score, 4),
                 price=round(price_score, 4),
                 final=round(final, 4),
+                meta=round(meta_score, 4),
+                roi_confidence=round(roi_debug.get(item.category, RoiRegion(category=item.category)).confidence, 4),
             )
             query_region = item.category if item.category in query_vectors else "global"
-            tags = ["vector:image-only", f"query_region:{query_region}", f"category:{item.category}", "source:crawled"]
+            tags = [
+                "vector:image-only",
+                f"query_region:{query_region}",
+                f"category:{item.category}",
+                "source:crawled",
+                "model:hist-embed",
+                f"index:{'qdrant' if self._qdrant_client else 'memory'}",
+            ]
             if price_cap is not None:
                 tags.append(f"price_cap:{price_cap}")
             if color_hint_text:
@@ -733,6 +777,7 @@ class JobService:
             top = candidates[:effective_look_count]
         results: list[MatchItem] = []
         for idx, (_, item, score, tags) in enumerate(top):
+            score.retrieval_rank = idx + 1
             results.append(
                 MatchItem(
                     category=item.category,
@@ -817,21 +862,22 @@ class JobService:
                 must_keep = [row for row in results if row.category in required_set]
                 optional = [row for row in results if row.category not in required_set]
                 results = (must_keep + optional)[:effective_look_count]
-        return results
+        return results, roi_debug
 
-    def _query_vectors_by_category(self, upload_image_path: Optional[str]) -> dict[str, list[float]]:
+    def _query_vectors_by_category(self, upload_image_path: Optional[str]) -> tuple[dict[str, list[float]], dict[str, RoiRegion]]:
         if not upload_image_path or Image is None:
-            return {}
+            return {}, {}
         path = Path(upload_image_path)
         if not path.exists():
-            return {}
+            return {}, {}
         try:
             with Image.open(path) as img:
                 rgb = img.convert("RGB")
                 width, height = rgb.size
                 if width < 16 or height < 16:
                     global_vec = self._embedding_from_image(rgb)
-                    return {"global": global_vec}
+                    roi = {"global": RoiRegion(category="global", bbox=[0.0, 0.0, 1.0, 1.0], confidence=0.5)}
+                    return {"global": global_vec}, roi
 
                 def crop_box(x1: float, y1: float, x2: float, y2: float) -> tuple[int, int, int, int]:
                     left = max(0, min(width - 1, int(width * x1)))
@@ -841,17 +887,25 @@ class JobService:
                     return (left, top, right, bottom)
 
                 vectors: dict[str, list[float]] = {"global": self._embedding_from_image(rgb)}
+                regions: dict[str, RoiRegion] = {
+                    "global": RoiRegion(category="global", bbox=[0.0, 0.0, 1.0, 1.0], confidence=0.92)
+                }
                 vectors["top"] = self._embedding_from_image(rgb.crop(crop_box(0.10, 0.05, 0.90, 0.45)))
+                regions["top"] = RoiRegion(category="top", bbox=[0.10, 0.05, 0.90, 0.45], confidence=0.86)
                 vectors["bottom"] = self._embedding_from_image(rgb.crop(crop_box(0.12, 0.45, 0.88, 0.82)))
+                regions["bottom"] = RoiRegion(category="bottom", bbox=[0.12, 0.45, 0.88, 0.82], confidence=0.88)
                 vectors["outer"] = self._embedding_from_image(rgb.crop(crop_box(0.06, 0.02, 0.94, 0.60)))
+                regions["outer"] = RoiRegion(category="outer", bbox=[0.06, 0.02, 0.94, 0.60], confidence=0.74)
                 vectors["shoes"] = self._embedding_from_image(rgb.crop(crop_box(0.15, 0.82, 0.85, 0.99)))
+                regions["shoes"] = RoiRegion(category="shoes", bbox=[0.15, 0.82, 0.85, 0.99], confidence=0.70)
 
                 bag_left = self._embedding_from_image(rgb.crop(crop_box(0.00, 0.25, 0.38, 0.80)))
                 bag_right = self._embedding_from_image(rgb.crop(crop_box(0.62, 0.25, 1.00, 0.80)))
                 vectors["bag"] = self._normalize_vector([(a + b) / 2.0 for a, b in zip(bag_left, bag_right)])
-                return vectors
+                regions["bag"] = RoiRegion(category="bag", bbox=[0.00, 0.25, 1.00, 0.80], confidence=0.58)
+                return vectors, regions
         except Exception:
-            return {}
+            return {}, {}
 
     @staticmethod
     def _effective_auto_match_count(look_count: int, category: Optional[str]) -> int:
@@ -901,7 +955,7 @@ class JobService:
 
         return selected[:look_count]
 
-    def _run_catalog_crawl(self, crawl_job_id: UUID, limit_per_category: int) -> None:
+    def _run_catalog_crawl(self, crawl_job_id: UUID, limit_per_category: int, mode: CrawlMode) -> None:
         with self._lock:
             job = self._crawl_jobs.get(crawl_job_id)
             if not job:
@@ -911,7 +965,7 @@ class JobService:
             self._persist_locked()
 
         try:
-            discovered, indexed = self._crawl_and_index(limit_per_category)
+            discovered, indexed = self._crawl_and_index(limit_per_category, mode)
             with self._lock:
                 job = self._crawl_jobs.get(crawl_job_id)
                 if not job:
@@ -931,16 +985,19 @@ class JobService:
                 job.completed_at = datetime.now(timezone.utc)
                 self._persist_locked()
 
-    def _crawl_and_index(self, limit_per_category: int) -> tuple[int, int]:
+    def _crawl_and_index(self, limit_per_category: int, mode: CrawlMode = CrawlMode.incremental) -> tuple[int, int]:
         products: dict[str, CatalogItemRecord] = {}
         seeds = self._catalog_seed_queries()
         target_per_category = max(1, max(limit_per_category, CATALOG_MIN_ITEMS_PER_CATEGORY))
         if httpx is None or BeautifulSoup is None:
             fallback = self._fallback_catalog_items()
             with self._lock:
+                if mode == CrawlMode.full:
+                    self._catalog = {}
                 for item in fallback:
                     self._catalog[item.product_id] = item
                 snapshot = list(self._catalog.values())
+                self._sync_qdrant(snapshot, mode=mode)
                 self._persist_locked()
             self._export_catalog_datasets(snapshot)
             return len(fallback), len(fallback)
@@ -972,11 +1029,141 @@ class JobService:
             indexed = len(products)
 
         with self._lock:
+            if mode == CrawlMode.full:
+                self._catalog = {}
             self._catalog.update(products)
             snapshot = list(self._catalog.values())
+            self._sync_qdrant(snapshot, mode=mode)
             self._persist_locked()
         self._export_catalog_datasets(snapshot)
         return len(products), indexed
+
+    def _set_crawl_timestamp(self, mode: CrawlMode) -> None:
+        now = datetime.now(timezone.utc)
+        if mode == CrawlMode.full:
+            self._last_full_reindex_at = now
+        else:
+            self._last_incremental_at = now
+
+    def _init_qdrant_client(self):
+        if not QDRANT_ENABLED or QdrantClient is None or qdrant_models is None:
+            return None
+        try:
+            client = QdrantClient(url=QDRANT_URL, timeout=2.0)
+            return client
+        except Exception:
+            return None
+
+    def _ensure_qdrant_collection(self, vector_size: int) -> None:
+        if self._qdrant_client is None or qdrant_models is None or vector_size <= 0:
+            return
+        try:
+            self._qdrant_client.get_collection(QDRANT_COLLECTION)
+        except Exception:
+            self._qdrant_client.recreate_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=qdrant_models.VectorParams(
+                    size=vector_size,
+                    distance=qdrant_models.Distance.COSINE,
+                ),
+            )
+
+    def _sync_qdrant(self, items: list[CatalogItemRecord], mode: CrawlMode) -> None:
+        if self._qdrant_client is None or qdrant_models is None:
+            self._set_crawl_timestamp(mode)
+            return
+        valid = [item for item in items if item.embedding]
+        if not valid:
+            self._set_crawl_timestamp(mode)
+            return
+        self._ensure_qdrant_collection(len(valid[0].embedding))
+        if mode == CrawlMode.full:
+            try:
+                self._qdrant_client.delete_collection(QDRANT_COLLECTION)
+            except Exception:
+                pass
+            self._ensure_qdrant_collection(len(valid[0].embedding))
+        points = []
+        for item in valid:
+            payload = {
+                "product_id": item.product_id,
+                "category": item.category,
+                "brand": item.brand,
+                "price": item.price if item.price is not None else -1,
+                "product_url": item.product_url,
+                "image_url": item.image_url,
+                "updated_at": item.updated_at.isoformat(),
+            }
+            pid = abs(hash(item.product_id)) % (2**63 - 1)
+            points.append(qdrant_models.PointStruct(id=pid, vector=item.embedding, payload=payload))
+        if points:
+            self._qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=points, wait=False)
+        self._set_crawl_timestamp(mode)
+
+    def _upsert_qdrant_item(self, item: CatalogItemRecord) -> None:
+        if self._qdrant_client is None or qdrant_models is None or not item.embedding:
+            return
+        self._ensure_qdrant_collection(len(item.embedding))
+        payload = {
+            "product_id": item.product_id,
+            "category": item.category,
+            "brand": item.brand,
+            "price": item.price if item.price is not None else -1,
+            "product_url": item.product_url,
+            "image_url": item.image_url,
+            "updated_at": item.updated_at.isoformat(),
+        }
+        pid = abs(hash(item.product_id)) % (2**63 - 1)
+        self._qdrant_client.upsert(
+            collection_name=QDRANT_COLLECTION,
+            points=[qdrant_models.PointStruct(id=pid, vector=item.embedding, payload=payload)],
+            wait=False,
+        )
+
+    def _qdrant_search_candidates(
+        self,
+        query_vectors: dict[str, list[float]],
+        fallback_items: list[CatalogItemRecord],
+        category: Optional[str],
+        limit: int,
+    ) -> list[CatalogItemRecord]:
+        if self._qdrant_client is None or qdrant_models is None:
+            return fallback_items
+        query_vector = query_vectors.get(category or "", []) if category else query_vectors.get("global", [])
+        if not query_vector:
+            query_vector = query_vectors.get("global", [])
+        if not query_vector:
+            return fallback_items
+        query_filter = None
+        if category:
+            query_filter = qdrant_models.Filter(
+                must=[qdrant_models.FieldCondition(key="category", match=qdrant_models.MatchValue(value=category))]
+            )
+        try:
+            points = self._qdrant_client.search(
+                collection_name=QDRANT_COLLECTION,
+                query_vector=query_vector,
+                query_filter=query_filter,
+                limit=limit,
+            )
+        except Exception:
+            return fallback_items
+        if not points:
+            return fallback_items
+        by_id = {item.product_id: item for item in fallback_items}
+        candidates: list[CatalogItemRecord] = []
+        seen: set[str] = set()
+        for point in points:
+            payload = point.payload or {}
+            product_id = str(payload.get("product_id") or "")
+            if not product_id or product_id in seen:
+                continue
+            item = by_id.get(product_id)
+            if item is None:
+                continue
+            candidates.append(item)
+            seen.add(product_id)
+        return candidates or fallback_items
 
     @staticmethod
     def _parse_dataset_export_dirs(raw_dirs: str) -> list[Path]:
@@ -1525,6 +1712,8 @@ class JobService:
         idem_payload = payload.get("idempotency_map", {})
         catalog_payload = payload.get("catalog", [])
         crawl_jobs_payload = payload.get("crawl_jobs", [])
+        last_incremental_at = payload.get("last_incremental_at")
+        last_full_reindex_at = payload.get("last_full_reindex_at")
         for raw in jobs_payload:
             try:
                 rec = self._record_from_dict(raw)
@@ -1550,6 +1739,16 @@ class JobService:
             except Exception:
                 continue
             self._crawl_jobs[crawl.crawl_job_id] = crawl
+        if last_incremental_at:
+            try:
+                self._last_incremental_at = datetime.fromisoformat(last_incremental_at)
+            except Exception:
+                self._last_incremental_at = None
+        if last_full_reindex_at:
+            try:
+                self._last_full_reindex_at = datetime.fromisoformat(last_full_reindex_at)
+            except Exception:
+                self._last_full_reindex_at = None
 
     def _persist_locked(self) -> None:
         self._state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1558,6 +1757,8 @@ class JobService:
             "idempotency_map": {k: str(v) for k, v in self._idempotency_map.items()},
             "catalog": [self._catalog_item_to_dict(item) for item in self._catalog.values()],
             "crawl_jobs": [self._crawl_job_to_dict(job) for job in self._crawl_jobs.values()],
+            "last_incremental_at": self._last_incremental_at.isoformat() if self._last_incremental_at else None,
+            "last_full_reindex_at": self._last_full_reindex_at.isoformat() if self._last_full_reindex_at else None,
         }
         tmp_path = self._state_file.with_suffix(f".{uuid4().hex}.tmp")
         tmp_path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
@@ -1587,6 +1788,7 @@ class JobService:
             "youtube_video_id": record.youtube_video_id,
             "youtube_url": record.youtube_url,
             "youtube_upload_status": record.youtube_upload_status.value,
+            "roi_debug": {k: v.model_dump(mode="json") for k, v in record.roi_debug.items()},
         }
 
     @staticmethod
@@ -1613,6 +1815,11 @@ class JobService:
             youtube_video_id=raw.get("youtube_video_id"),
             youtube_url=raw.get("youtube_url"),
             youtube_upload_status=YouTubeUploadStatus(raw.get("youtube_upload_status", YouTubeUploadStatus.PENDING.value)),
+            roi_debug={
+                str(key): RoiRegion.model_validate(value)
+                for key, value in (raw.get("roi_debug") or {}).items()
+                if isinstance(value, dict)
+            },
         )
 
     @staticmethod
@@ -1648,6 +1855,7 @@ class JobService:
         return {
             "crawl_job_id": str(job.crawl_job_id),
             "status": job.status.value,
+            "mode": job.mode.value,
             "started_at": job.started_at.isoformat() if job.started_at else None,
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
             "total_discovered": job.total_discovered,
@@ -1660,6 +1868,7 @@ class JobService:
         return CrawlJobRecord(
             crawl_job_id=UUID(raw["crawl_job_id"]),
             status=CrawlJobStatus(raw["status"]),
+            mode=CrawlMode(raw.get("mode", CrawlMode.incremental.value)),
             started_at=datetime.fromisoformat(raw["started_at"]) if raw.get("started_at") else None,
             completed_at=datetime.fromisoformat(raw["completed_at"]) if raw.get("completed_at") else None,
             total_discovered=int(raw.get("total_discovered", 0)),

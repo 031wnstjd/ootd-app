@@ -47,12 +47,26 @@ class CrawlJobStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class CrawlMode(str, Enum):
+    incremental = "incremental"
+    full = "full"
+
+
 class ScoreBreakdown(BaseModel):
     image: float
     text: float
     category: float
     price: float
     final: float
+    meta: Optional[float] = None
+    roi_confidence: Optional[float] = None
+    retrieval_rank: Optional[int] = None
+
+
+class RoiRegion(BaseModel):
+    category: str
+    bbox: list[float] = Field(default_factory=list)
+    confidence: float = 0.0
 
 
 class MatchItem(BaseModel):
@@ -89,6 +103,7 @@ class JobDetailResponse(BaseModel):
     youtube_video_id: Optional[str] = None
     youtube_url: Optional[str] = None
     youtube_upload_status: Optional[YouTubeUploadStatus] = None
+    roi_debug: dict[str, RoiRegion] = Field(default_factory=dict)
 
 
 class RerankRequest(BaseModel):
@@ -126,11 +141,13 @@ class PublishResponse(BaseModel):
 class CatalogCrawlJobResponse(BaseModel):
     crawl_job_id: UUID
     status: CrawlJobStatus
+    mode: CrawlMode
 
 
 class CatalogCrawlJobDetailResponse(BaseModel):
     crawl_job_id: UUID
     status: CrawlJobStatus
+    mode: CrawlMode
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     total_discovered: int = 0
@@ -143,6 +160,9 @@ class CatalogStatsResponse(BaseModel):
     total_indexed_products: int
     categories: dict[str, int] = Field(default_factory=dict)
     last_crawl_completed_at: Optional[datetime] = None
+    per_category_indexed: dict[str, int] = Field(default_factory=dict)
+    last_incremental_at: Optional[datetime] = None
+    last_full_reindex_at: Optional[datetime] = None
 
 
 class CatalogIndexRebuildResponse(BaseModel):

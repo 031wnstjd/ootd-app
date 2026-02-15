@@ -417,11 +417,12 @@ def test_publish_endpoint_requires_youtube_credentials(client: TestClient, monke
 
 
 def test_catalog_ops_endpoints(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(api_main.service, "_crawl_and_index", lambda limit: (8, 6))
+    monkeypatch.setattr(api_main.service, "_crawl_and_index", lambda limit, mode=None: (8, 6))
 
     started = client.post("/v1/catalog/crawl/jobs?limit_per_category=10")
     assert started.status_code == 202
     crawl_job_id = started.json()["crawl_job_id"]
+    assert started.json()["mode"] == "incremental"
 
     detail = None
     end = time.time() + 2
@@ -434,6 +435,7 @@ def test_catalog_ops_endpoints(client: TestClient, monkeypatch: pytest.MonkeyPat
         time.sleep(0.02)
     assert detail is not None
     assert detail["status"] == "COMPLETED"
+    assert detail["mode"] == "incremental"
     assert detail["total_discovered"] == 8
     assert detail["total_indexed"] == 6
 
