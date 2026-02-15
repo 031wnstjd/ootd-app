@@ -133,6 +133,7 @@ docker run --rm -v "$PWD":/work alpine sh -lc "chown -R $(id -u):$(id -g) /work/
 - 템플릿 고정 후보 대신 카탈로그(크롤링) 기반으로 후보를 검색합니다.
 - 상품 이미지 임베딩(히스토그램 기반)을 생성하여 업로드 이미지와 코사인 유사도로 랭킹합니다.
 - 카탈로그가 비어 있거나 외부 수집이 실패하면 검색 링크 기반 fallback 후보를 반환합니다.
+- `CATALOG_MIN_IMAGE_SIM` (default `0.35`)로 최소 이미지 유사도 임계값을 조정할 수 있습니다.
 
 ## Real Product/Video Notes
 
