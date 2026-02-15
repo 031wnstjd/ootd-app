@@ -1,4 +1,5 @@
 export type QualityMode = 'auto_gate' | 'human_review';
+export type TargetGender = 'men' | 'women' | 'unisex';
 
 export type JobStatus =
   | 'INGESTED'
@@ -62,6 +63,7 @@ export interface JobDetailResponse {
   job_id: string;
   status: JobStatus;
   quality_mode: QualityMode;
+  target_gender: TargetGender;
   look_count: number;
   progress?: number;
   items?: MatchItem[];
@@ -165,6 +167,7 @@ export interface CreateJobInput {
   imageFile: File;
   lookCount: number;
   qualityMode: QualityMode;
+  targetGender: TargetGender;
   tone?: string;
   theme?: string;
 }

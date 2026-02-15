@@ -49,6 +49,7 @@ export async function createJob(input: CreateJobInput): Promise<CreateJobRespons
   form.append('image', input.imageFile);
   form.append('look_count', String(input.lookCount));
   form.append('quality_mode', input.qualityMode);
+  form.append('target_gender', input.targetGender);
   if (input.tone) form.append('tone', input.tone);
   if (input.theme) form.append('theme', input.theme);
 

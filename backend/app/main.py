@@ -23,6 +23,7 @@ from .models import (
     RerankRequest,
     RerankResponse,
     RetryResponse,
+    TargetGender,
 )
 from .service import JobService
 
@@ -42,6 +43,7 @@ async def create_job(
     image: UploadFile = File(...),
     look_count: int = Form(..., ge=1, le=5),
     quality_mode: QualityMode = Form(...),
+    target_gender: TargetGender = Form(default=TargetGender.men),
     theme: str | None = Form(default=None),
     tone: str | None = Form(default=None),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -54,6 +56,7 @@ async def create_job(
     return service.create_job(
         look_count=look_count,
         quality_mode=quality_mode,
+        target_gender=target_gender,
         theme=theme,
         tone=tone,
         image_bytes=content,

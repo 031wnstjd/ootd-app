@@ -46,6 +46,7 @@ from .models import (
     RoiRegion,
     RetryResponse,
     ScoreBreakdown,
+    TargetGender,
     YouTubeUploadStatus,
 )
 
@@ -113,6 +114,7 @@ QDRANT_TOPK_MULTIPLIER = int(os.getenv("QDRANT_TOPK_MULTIPLIER", "12"))
 QDRANT_TIMEOUT_SECONDS = float(os.getenv("QDRANT_TIMEOUT_SECONDS", "10"))
 QDRANT_UPSERT_BATCH_SIZE = int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", "200"))
 CATEGORY_QUERY_PRIORITY = ["top", "bottom", "outer", "shoes", "bag"]
+DEFAULT_TARGET_GENDER = os.getenv("DEFAULT_TARGET_GENDER", "men")
 
 
 @dataclass
@@ -120,6 +122,7 @@ class JobRecord:
     job_id: UUID
     status: JobStatus
     quality_mode: QualityMode
+    target_gender: TargetGender
     look_count: int
     created_at: datetime
     completed_at: Optional[datetime] = None
@@ -150,6 +153,7 @@ class CatalogItemRecord:
     product_url: str
     image_url: str
     price: Optional[int]
+    gender: TargetGender = TargetGender.unisex
     embedding: list[float] = field(default_factory=list)
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -205,6 +209,7 @@ class JobService:
         self,
         look_count: int,
         quality_mode: QualityMode,
+        target_gender: TargetGender,
         theme: str | None,
         tone: str | None,
         image_bytes: bytes,
@@ -224,6 +229,7 @@ class JobService:
                 job_id=job_id,
                 status=JobStatus.INGESTED,
                 quality_mode=quality_mode,
+                target_gender=target_gender,
                 look_count=look_count,
                 created_at=datetime.now(timezone.utc),
                 progress=5,
@@ -261,6 +267,7 @@ class JobService:
             job_id=job_id,
             status=JobStatus.MATCHED,
             quality_mode=QualityMode.auto_gate,
+            target_gender=record.target_gender,
             look_count=1,
             created_at=datetime.now(timezone.utc),
             upload_image_path=upload_image_path,
@@ -407,6 +414,7 @@ class JobService:
 
             look_count = record.look_count
             quality_mode = record.quality_mode
+            target_gender = record.target_gender
             theme = record.theme
             tone = record.tone
             attempts = record.attempts + 1
@@ -421,6 +429,7 @@ class JobService:
         created = self.create_job(
             look_count=look_count,
             quality_mode=quality_mode,
+            target_gender=target_gender,
             theme=theme,
             tone=tone,
             image_bytes=path.read_bytes(),
@@ -485,6 +494,7 @@ class JobService:
             job_id=r.job_id,
             status=r.status,
             quality_mode=r.quality_mode,
+            target_gender=r.target_gender,
             look_count=r.look_count,
             progress=r.progress,
             items=r.items,
@@ -525,6 +535,7 @@ class JobService:
             category=None,
             price_cap=None,
             color_hint=tone or theme,
+            target_gender=rec.target_gender,
         )
         with self._lock:
             rec = self._jobs.get(job_id)
@@ -672,6 +683,7 @@ class JobService:
             category=None,
             price_cap=None,
             color_hint=record.tone or record.theme,
+            target_gender=record.target_gender,
         )
         return items
 
@@ -695,6 +707,7 @@ class JobService:
             category=category,
             price_cap=normalized_price_cap,
             color_hint=color_hint,
+            target_gender=record.target_gender,
         )
         color_text = (color_hint or "").strip().title()
         if color_text:
@@ -712,6 +725,7 @@ class JobService:
         category: Optional[str],
         price_cap: Optional[int],
         color_hint: Optional[str],
+        target_gender: TargetGender,
     ) -> tuple[list[MatchItem], dict[str, RoiRegion]]:
         effective_look_count = self._effective_auto_match_count(look_count, category)
         query_vectors, roi_debug = self._query_vectors_by_category(upload_image_path)
@@ -737,7 +751,10 @@ class JobService:
             limit=max(30, effective_look_count * QDRANT_TOPK_MULTIPLIER),
         )
         for item in candidate_items:
+            effective_item_gender = self._effective_item_gender(item)
             if category and item.category != category:
+                continue
+            if not self._is_gender_compatible(target_gender, effective_item_gender):
                 continue
             if price_cap is not None and item.price is not None and item.price > price_cap:
                 continue
@@ -754,8 +771,13 @@ class JobService:
             category_score = 1.0 if category and item.category == category else 0.8
             price_score = self._price_fit_score(item.price, price_cap)
             style_score = self._style_similarity_score(query_style.get(item.category), self._item_style_signature(item))
-            meta_score = 0.8 * style_score + 0.2 * price_score
-            final = 0.80 * image_sim + 0.18 * style_score + 0.02 * price_score
+            query_sig = query_style.get(item.category) or query_style.get("global")
+            color_score = self._color_similarity_score(
+                query_rgb=(query_sig[0] if query_sig else [0.0, 0.0, 0.0]),
+                item_name=f"{item.brand} {item.product_name}",
+            )
+            meta_score = (0.72 * style_score) + (0.20 * color_score) + (0.08 * price_score)
+            final = (0.72 * image_sim) + (0.20 * style_score) + (0.06 * color_score) + (0.02 * price_score)
             score = ScoreBreakdown(
                 image=round(image_sim, 4),
                 text=round(text_score, 4),
@@ -773,6 +795,9 @@ class JobService:
                 "source:crawled",
                 "model:hist-embed",
                 "rerank:style-signature",
+                "rerank:color-compat",
+                f"target_gender:{target_gender.value}",
+                f"item_gender:{effective_item_gender.value}",
                 f"index:{'qdrant' if self._qdrant_client else 'memory'}",
             ]
             if price_cap is not None:
@@ -821,7 +846,9 @@ class JobService:
                     (
                         item
                         for item in fallback
-                        if item.category == required_category and item.product_id not in existing_product_ids
+                        if item.category == required_category
+                        and item.product_id not in existing_product_ids
+                        and self._is_gender_compatible(target_gender, self._effective_item_gender(item))
                     ),
                     None,
                 )
@@ -851,6 +878,8 @@ class JobService:
                 if needed <= 0:
                     break
                 if item.product_id in existing_product_ids:
+                    continue
+                if not self._is_gender_compatible(target_gender, self._effective_item_gender(item)):
                     continue
                 existing_product_ids.add(item.product_id)
                 results.append(
@@ -1100,6 +1129,7 @@ class JobService:
                 payload = {
                     "product_id": item.product_id,
                     "category": item.category,
+                    "gender": item.gender.value,
                     "brand": item.brand,
                     "price": item.price if item.price is not None else -1,
                     "product_url": item.product_url,
@@ -1125,6 +1155,7 @@ class JobService:
             payload = {
                 "product_id": item.product_id,
                 "category": item.category,
+                "gender": item.gender.value,
                 "brand": item.brand,
                 "price": item.price if item.price is not None else -1,
                 "product_url": item.product_url,
@@ -1393,6 +1424,11 @@ class JobService:
                         product_url=self._normalize_url(product_url),
                         image_url=image_url,
                         price=price,
+                        gender=self._infer_item_gender(
+                            product_name=product_name,
+                            brand=str(row.get("brandName") or row.get("brand") or "MUSINSA"),
+                            raw_gender=str(row.get("sex") or row.get("gender") or ""),
+                        ),
                         embedding=[],
                     )
                 )
@@ -1453,6 +1489,7 @@ class JobService:
                 product_url=product_url,
                 image_url=image_url,
                 price=self._extract_price(anchor.get_text(" ", strip=True)),
+                gender=self._infer_item_gender(product_name=product_name, brand="MUSINSA"),
                 embedding=[],
             )
             records.append(record)
@@ -1507,6 +1544,118 @@ class JobService:
         over = min(1.0, (price - price_cap) / max(price_cap, 1))
         return max(0.0, 1.0 - over)
 
+    @staticmethod
+    def _coerce_gender(value: str | TargetGender | None, fallback: TargetGender = TargetGender.unisex) -> TargetGender:
+        if isinstance(value, TargetGender):
+            return value
+        try:
+            return TargetGender(str(value))
+        except Exception:
+            return fallback
+
+    @staticmethod
+    def _is_gender_compatible(target_gender: TargetGender, item_gender: TargetGender) -> bool:
+        if target_gender == TargetGender.unisex:
+            return True
+        if item_gender == TargetGender.unisex:
+            return True
+        return target_gender == item_gender
+
+    @staticmethod
+    def _infer_item_gender(product_name: str, brand: str = "", raw_gender: str = "") -> TargetGender:
+        raw = f"{raw_gender} {brand} {product_name}".lower()
+        men_tokens = ["남성", "남자", "맨즈", "men", "man", "mens", "male", "boy"]
+        women_tokens = ["여성", "여자", "우먼", "우먼즈", "women", "woman", "womens", "female", "girl", "lady"]
+        has_men = any(token in raw for token in men_tokens)
+        has_women = any(token in raw for token in women_tokens)
+        if has_men and not has_women:
+            return TargetGender.men
+        if has_women and not has_men:
+            return TargetGender.women
+        return TargetGender.unisex
+
+    def _effective_item_gender(self, item: CatalogItemRecord) -> TargetGender:
+        if item.gender != TargetGender.unisex:
+            return item.gender
+        inferred = self._infer_item_gender(item.product_name, item.brand)
+        return inferred
+
+    @staticmethod
+    def _color_similarity_score(query_rgb: list[float], item_name: str) -> float:
+        if not query_rgb or len(query_rgb) != 3:
+            return 0.6
+        palette = {
+            "black": [0.08, 0.08, 0.08],
+            "white": [0.92, 0.92, 0.92],
+            "gray": [0.50, 0.50, 0.50],
+            "navy": [0.10, 0.14, 0.35],
+            "blue": [0.18, 0.30, 0.72],
+            "brown": [0.42, 0.28, 0.20],
+            "beige": [0.78, 0.70, 0.56],
+            "khaki": [0.58, 0.56, 0.36],
+            "green": [0.22, 0.44, 0.28],
+            "red": [0.68, 0.18, 0.18],
+        }
+        aliases = {
+            "블랙": "black",
+            "black": "black",
+            "오프화이트": "white",
+            "white": "white",
+            "화이트": "white",
+            "그레이": "gray",
+            "gray": "gray",
+            "grey": "gray",
+            "네이비": "navy",
+            "navy": "navy",
+            "블루": "blue",
+            "blue": "blue",
+            "브라운": "brown",
+            "brown": "brown",
+            "베이지": "beige",
+            "beige": "beige",
+            "카키": "khaki",
+            "khaki": "khaki",
+            "그린": "green",
+            "green": "green",
+            "레드": "red",
+            "red": "red",
+        }
+        name = item_name.lower()
+        item_colors = [canonical for token, canonical in aliases.items() if token in name]
+        if not item_colors:
+            return 0.65
+
+        def color_dist(a: list[float], b: list[float]) -> float:
+            return math.sqrt(sum((x - y) * (x - y) for x, y in zip(a, b)))
+
+        r, g, b = query_rgb
+        brightness = (r + g + b) / 3.0
+        if brightness < 0.26:
+            # Dark tone disambiguation: navy tends to keep blue channel dominant.
+            if b > (r + 0.015) and b > (g + 0.012):
+                closest = "navy"
+            elif abs(r - g) < 0.03 and abs(g - b) < 0.03:
+                closest = "black"
+            else:
+                closest = min(palette.items(), key=lambda kv: color_dist(query_rgb, kv[1]))[0]
+        else:
+            closest = min(palette.items(), key=lambda kv: color_dist(query_rgb, kv[1]))[0]
+        if closest in item_colors:
+            return 1.0
+        neighborhood = {
+            "navy": {"blue"},
+            "blue": {"navy"},
+            "brown": {"beige", "khaki"},
+            "beige": {"brown", "khaki"},
+            "khaki": {"brown", "beige"},
+            "black": {"gray"},
+            "gray": {"black", "white"},
+            "white": {"gray"},
+        }
+        if any(color in neighborhood.get(closest, set()) for color in item_colors):
+            return 0.75
+        return 0.20
+
     def _embedding_from_text(self, text: str) -> list[float]:
         if not text:
             return [0.0] * 48
@@ -1534,15 +1683,34 @@ class JobService:
         if not pixels:
             return [0.0, 0.0, 0.0], 0.0, 0.0
 
-        total = float(len(pixels))
+        w, h = rgb.size
+        weighted: list[tuple[float, tuple[int, int, int], float]] = []
+        idx = 0
+        for y in range(h):
+            for x in range(w):
+                r, g, b = pixels[idx]
+                idx += 1
+                _, s, _ = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+                nx = (x / max(1, w - 1)) - 0.5
+                ny = (y / max(1, h - 1)) - 0.5
+                center_weight = max(0.2, 1.0 - (nx * nx + ny * ny) * 1.8)
+                # Drop near-white background and very dark noise.
+                if r > 245 and g > 245 and b > 245:
+                    continue
+                if r < 10 and g < 10 and b < 10:
+                    continue
+                weighted.append((center_weight, (r, g, b), s))
+        if not weighted:
+            weighted = [(1.0, p, colorsys.rgb_to_hsv(p[0] / 255.0, p[1] / 255.0, p[2] / 255.0)[1]) for p in pixels]
+
+        total = float(sum(weight for weight, _, _ in weighted))
         sum_r = sum_g = sum_b = 0.0
         sat_sum = 0.0
-        for r, g, b in pixels:
-            sum_r += r
-            sum_g += g
-            sum_b += b
-            _, s, _ = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
-            sat_sum += s
+        for weight, (r, g, b), s in weighted:
+            sum_r += r * weight
+            sum_g += g * weight
+            sum_b += b * weight
+            sat_sum += s * weight
         mean_rgb = [sum_r / (255.0 * total), sum_g / (255.0 * total), sum_b / (255.0 * total)]
         sat_mean = sat_sum / total
 
@@ -1714,6 +1882,7 @@ class JobService:
                         product_url=url,
                         image_url=url,
                         price=28000 + idx * 6000,
+                        gender=TargetGender.unisex,
                         embedding=seed_vec,
                     )
                 )
@@ -1919,6 +2088,7 @@ class JobService:
             "job_id": str(record.job_id),
             "status": record.status.value,
             "quality_mode": record.quality_mode.value,
+            "target_gender": record.target_gender.value,
             "look_count": record.look_count,
             "created_at": record.created_at.isoformat(),
             "completed_at": record.completed_at.isoformat() if record.completed_at else None,
@@ -1946,6 +2116,7 @@ class JobService:
             job_id=UUID(raw["job_id"]),
             status=JobStatus(raw["status"]),
             quality_mode=QualityMode(raw["quality_mode"]),
+            target_gender=JobService._coerce_gender(raw.get("target_gender", DEFAULT_TARGET_GENDER), TargetGender.men),
             look_count=int(raw["look_count"]),
             created_at=datetime.fromisoformat(raw["created_at"]),
             completed_at=datetime.fromisoformat(raw["completed_at"]) if raw.get("completed_at") else None,
@@ -1981,6 +2152,7 @@ class JobService:
             "product_url": item.product_url,
             "image_url": item.image_url,
             "price": item.price,
+            "gender": item.gender.value,
             "embedding": item.embedding,
             "updated_at": item.updated_at.isoformat(),
         }
@@ -1995,6 +2167,7 @@ class JobService:
             product_url=str(raw.get("product_url") or ""),
             image_url=str(raw.get("image_url") or ""),
             price=int(raw["price"]) if raw.get("price") is not None else None,
+            gender=JobService._coerce_gender(raw.get("gender", TargetGender.unisex.value), TargetGender.unisex),
             embedding=[float(v) for v in raw.get("embedding", [])],
             updated_at=datetime.fromisoformat(raw["updated_at"]) if raw.get("updated_at") else datetime.now(timezone.utc),
         )

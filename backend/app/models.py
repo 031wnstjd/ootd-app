@@ -13,6 +13,12 @@ class QualityMode(str, Enum):
     human_review = "human_review"
 
 
+class TargetGender(str, Enum):
+    men = "men"
+    women = "women"
+    unisex = "unisex"
+
+
 class JobStatus(str, Enum):
     INGESTED = "INGESTED"
     ANALYZED = "ANALYZED"
@@ -92,6 +98,7 @@ class JobDetailResponse(BaseModel):
     job_id: UUID
     status: JobStatus
     quality_mode: QualityMode
+    target_gender: TargetGender = TargetGender.men
     look_count: int
     progress: Optional[int] = Field(default=None, ge=0, le=100)
     items: Optional[list[MatchItem]] = None

@@ -27,6 +27,7 @@ import {
   MetricsResponse,
   RoiRegion,
   QualityMode,
+  TargetGender,
   ScoreBreakdown
 } from '@/lib/types';
 
@@ -141,6 +142,7 @@ export default function DashboardPage() {
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [lookCount, setLookCount] = useState<number>(3);
   const [qualityMode, setQualityMode] = useState<QualityMode>('auto_gate');
+  const [targetGender, setTargetGender] = useState<TargetGender>('men');
   const [tone, setTone] = useState('clean');
   const [theme, setTheme] = useState('street casual');
 
@@ -297,6 +299,7 @@ export default function DashboardPage() {
         imageFile,
         lookCount,
         qualityMode,
+        targetGender,
         tone: tone.trim(),
         theme: theme.trim()
       });
@@ -496,7 +499,7 @@ export default function DashboardPage() {
             />
           </label>
 
-          <div className="mb-4 grid grid-cols-2 gap-4">
+          <div className="mb-4 grid grid-cols-3 gap-4">
             <label className="text-sm">
               <span className="mb-1 block font-medium">look_count</span>
               <select
@@ -521,6 +524,18 @@ export default function DashboardPage() {
               >
                 <option value="auto_gate">auto_gate</option>
                 <option value="human_review">human_review</option>
+              </select>
+            </label>
+            <label className="text-sm">
+              <span className="mb-1 block font-medium">target_gender</span>
+              <select
+                value={targetGender}
+                onChange={(e) => setTargetGender(e.target.value as TargetGender)}
+                className="w-full rounded-md border border-slate-300 px-3 py-2"
+              >
+                <option value="men">men</option>
+                <option value="women">women</option>
+                <option value="unisex">unisex</option>
               </select>
             </label>
           </div>
@@ -578,6 +593,7 @@ export default function DashboardPage() {
                 <p className={statusTone(job.status)}>status: {job.status}</p>
                 <p>progress: {job.progress ?? '-'}%</p>
                 <p>quality_mode: {job.quality_mode}</p>
+                <p>target_gender: {job.target_gender}</p>
                 <p>look_count: {job.look_count}</p>
                 <p>attempts: {job.attempts ?? 1}</p>
                 <p>parent_job_id: {job.parent_job_id ?? '-'}</p>
