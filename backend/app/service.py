@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import colorsys
 import json
 import math
 import os
@@ -111,6 +112,7 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "musinsa_catalog")
 QDRANT_TOPK_MULTIPLIER = int(os.getenv("QDRANT_TOPK_MULTIPLIER", "12"))
 QDRANT_TIMEOUT_SECONDS = float(os.getenv("QDRANT_TIMEOUT_SECONDS", "10"))
 QDRANT_UPSERT_BATCH_SIZE = int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", "200"))
+CATEGORY_QUERY_PRIORITY = ["top", "bottom", "outer", "shoes", "bag"]
 
 
 @dataclass
@@ -187,6 +189,7 @@ class JobService:
         self._enable_real_render = enable_real_render
         self._last_incremental_at: Optional[datetime] = None
         self._last_full_reindex_at: Optional[datetime] = None
+        self._item_style_signature_cache: dict[str, tuple[list[float], float, float]] = {}
         self._qdrant_client = self._init_qdrant_client()
         self._uploads_dir.mkdir(parents=True, exist_ok=True)
         self._previews_dir.mkdir(parents=True, exist_ok=True)
@@ -712,6 +715,7 @@ class JobService:
     ) -> tuple[list[MatchItem], dict[str, RoiRegion]]:
         effective_look_count = self._effective_auto_match_count(look_count, category)
         query_vectors, roi_debug = self._query_vectors_by_category(upload_image_path)
+        query_style = self._query_style_signatures_by_category(upload_image_path)
         global_query_vector = query_vectors.get("global", [])
         if not global_query_vector:
             return [], roi_debug
@@ -724,10 +728,12 @@ class JobService:
 
         color_hint_text = (color_hint or "").strip().lower()
         candidates: list[tuple[float, CatalogItemRecord, ScoreBreakdown, list[str]]] = []
+        required_categories = self._required_categories_for_auto_match(effective_look_count, category)
         candidate_items = self._qdrant_search_candidates(
             query_vectors=query_vectors,
             fallback_items=catalog_items,
             category=category,
+            preferred_categories=required_categories or CATEGORY_QUERY_PRIORITY,
             limit=max(30, effective_look_count * QDRANT_TOPK_MULTIPLIER),
         )
         for item in candidate_items:
@@ -737,7 +743,9 @@ class JobService:
                 continue
             if not item.embedding:
                 continue
-            item_query = query_vectors.get(item.category) or global_query_vector
+            item_query = self._compose_query_vector(item.category, query_vectors)
+            if not item_query:
+                item_query = global_query_vector
             image_sim = self._cosine_similarity(item_query, item.embedding)
             min_image_sim = 0.0 if item.product_id.startswith("fallback-") else CATALOG_MIN_IMAGE_SIM
             if image_sim < min_image_sim:
@@ -745,8 +753,9 @@ class JobService:
             text_score = 0.0
             category_score = 1.0 if category and item.category == category else 0.8
             price_score = self._price_fit_score(item.price, price_cap)
-            meta_score = price_score
-            final = 0.95 * image_sim + 0.05 * meta_score
+            style_score = self._style_similarity_score(query_style.get(item.category), self._item_style_signature(item))
+            meta_score = 0.8 * style_score + 0.2 * price_score
+            final = 0.80 * image_sim + 0.18 * style_score + 0.02 * price_score
             score = ScoreBreakdown(
                 image=round(image_sim, 4),
                 text=round(text_score, 4),
@@ -763,6 +772,7 @@ class JobService:
                 f"category:{item.category}",
                 "source:crawled",
                 "model:hist-embed",
+                "rerank:style-signature",
                 f"index:{'qdrant' if self._qdrant_client else 'memory'}",
             ]
             if price_cap is not None:
@@ -772,7 +782,6 @@ class JobService:
             candidates.append((final, item, score, tags))
 
         candidates.sort(key=lambda row: row[0], reverse=True)
-        required_categories = self._required_categories_for_auto_match(effective_look_count, category)
         if required_categories:
             top = self._select_balanced_candidates(candidates, effective_look_count, required_categories)
         else:
@@ -1136,45 +1145,72 @@ class JobService:
         query_vectors: dict[str, list[float]],
         fallback_items: list[CatalogItemRecord],
         category: Optional[str],
+        preferred_categories: Optional[list[str]],
         limit: int,
     ) -> list[CatalogItemRecord]:
         if self._qdrant_client is None or qdrant_models is None:
             return fallback_items
-        query_vector = query_vectors.get(category or "", []) if category else query_vectors.get("global", [])
-        if not query_vector:
-            query_vector = query_vectors.get("global", [])
-        if not query_vector:
-            return fallback_items
-        query_filter = None
-        if category:
-            query_filter = qdrant_models.Filter(
-                must=[qdrant_models.FieldCondition(key="category", match=qdrant_models.MatchValue(value=category))]
-            )
-        try:
-            points = self._qdrant_client.search(
-                collection_name=QDRANT_COLLECTION,
-                query_vector=query_vector,
-                query_filter=query_filter,
-                limit=limit,
-            )
-        except Exception:
-            return fallback_items
-        if not points:
-            return fallback_items
         by_id = {item.product_id: item for item in fallback_items}
-        candidates: list[CatalogItemRecord] = []
         seen: set[str] = set()
-        for point in points:
-            payload = point.payload or {}
-            product_id = str(payload.get("product_id") or "")
-            if not product_id or product_id in seen:
-                continue
-            item = by_id.get(product_id)
-            if item is None:
-                continue
-            candidates.append(item)
-            seen.add(product_id)
+        candidates: list[CatalogItemRecord] = []
+
+        def append_from_points(points: list) -> None:
+            for point in points:
+                payload = point.payload or {}
+                product_id = str(payload.get("product_id") or "")
+                if not product_id or product_id in seen:
+                    continue
+                item = by_id.get(product_id)
+                if item is None:
+                    continue
+                candidates.append(item)
+                seen.add(product_id)
+
+        def search_once(query_vector: list[float], category_filter: Optional[str], topk: int) -> None:
+            if not query_vector:
+                return
+            query_filter = None
+            if category_filter:
+                query_filter = qdrant_models.Filter(
+                    must=[qdrant_models.FieldCondition(key="category", match=qdrant_models.MatchValue(value=category_filter))]
+                )
+            try:
+                points = self._qdrant_client.search(
+                    collection_name=QDRANT_COLLECTION,
+                    query_vector=query_vector,
+                    query_filter=query_filter,
+                    limit=topk,
+                )
+            except Exception:
+                return
+            append_from_points(points or [])
+
+        if category:
+            query_vector = self._compose_query_vector(category, query_vectors)
+            search_once(query_vector, category, limit)
+            if not candidates:
+                search_once(query_vectors.get("global", []), category, limit)
+            return candidates or fallback_items
+
+        target_categories = preferred_categories or CATEGORY_QUERY_PRIORITY
+        per_category_topk = max(12, limit // max(1, len(target_categories)))
+        for cat in target_categories:
+            query_vector = self._compose_query_vector(cat, query_vectors)
+            search_once(query_vector, cat, per_category_topk)
+
+        # Add global search to capture cross-category alternatives after category-first retrieval.
+        search_once(query_vectors.get("global", []), None, limit)
         return candidates or fallback_items
+
+    def _compose_query_vector(self, category: str, query_vectors: dict[str, list[float]]) -> list[float]:
+        cat_vec = query_vectors.get(category, [])
+        global_vec = query_vectors.get("global", [])
+        if cat_vec and global_vec and len(cat_vec) == len(global_vec):
+            mixed = [0.65 * c + 0.35 * g for c, g in zip(cat_vec, global_vec)]
+            return self._normalize_vector(mixed)
+        if cat_vec:
+            return cat_vec
+        return global_vec
 
     @staticmethod
     def _parse_dataset_export_dirs(raw_dirs: str) -> list[Path]:
@@ -1491,6 +1527,104 @@ class JobService:
         except Exception:
             return []
 
+    @staticmethod
+    def _style_signature_from_image(img: "Image.Image") -> tuple[list[float], float, float]:
+        rgb = img.convert("RGB").resize((48, 48))
+        pixels = list(rgb.getdata())
+        if not pixels:
+            return [0.0, 0.0, 0.0], 0.0, 0.0
+
+        total = float(len(pixels))
+        sum_r = sum_g = sum_b = 0.0
+        sat_sum = 0.0
+        for r, g, b in pixels:
+            sum_r += r
+            sum_g += g
+            sum_b += b
+            _, s, _ = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+            sat_sum += s
+        mean_rgb = [sum_r / (255.0 * total), sum_g / (255.0 * total), sum_b / (255.0 * total)]
+        sat_mean = sat_sum / total
+
+        if ImageFilter is not None:
+            edges = rgb.convert("L").filter(ImageFilter.FIND_EDGES)
+        else:
+            edges = rgb.convert("L")
+        edge_vals = list(edges.getdata())
+        edge_density = (sum(edge_vals) / max(1.0, len(edge_vals))) / 255.0
+        return mean_rgb, sat_mean, edge_density
+
+    def _item_style_signature(self, item: CatalogItemRecord) -> tuple[list[float], float, float]:
+        cached = self._item_style_signature_cache.get(item.product_id)
+        if cached is not None:
+            return cached
+        cache_path = self._catalog_cache_dir / f"{self._product_id_from_url(item.image_url)}.img"
+        if not cache_path.exists() or Image is None:
+            signature = ([0.0, 0.0, 0.0], 0.0, 0.0)
+            self._item_style_signature_cache[item.product_id] = signature
+            return signature
+        try:
+            with Image.open(cache_path) as img:
+                signature = self._style_signature_from_image(img)
+        except Exception:
+            signature = ([0.0, 0.0, 0.0], 0.0, 0.0)
+        self._item_style_signature_cache[item.product_id] = signature
+        return signature
+
+    def _query_style_signatures_by_category(
+        self, upload_image_path: Optional[str]
+    ) -> dict[str, tuple[list[float], float, float]]:
+        if not upload_image_path or Image is None:
+            return {}
+        path = Path(upload_image_path)
+        if not path.exists():
+            return {}
+        try:
+            with Image.open(path) as img:
+                rgb = img.convert("RGB")
+                width, height = rgb.size
+                if width < 16 or height < 16:
+                    base = self._style_signature_from_image(rgb)
+                    return {"global": base}
+
+                def crop_box(x1: float, y1: float, x2: float, y2: float) -> tuple[int, int, int, int]:
+                    left = max(0, min(width - 1, int(width * x1)))
+                    top = max(0, min(height - 1, int(height * y1)))
+                    right = max(left + 1, min(width, int(width * x2)))
+                    bottom = max(top + 1, min(height, int(height * y2)))
+                    return (left, top, right, bottom)
+
+                out: dict[str, tuple[list[float], float, float]] = {}
+                out["global"] = self._style_signature_from_image(rgb)
+                out["top"] = self._style_signature_from_image(rgb.crop(crop_box(0.10, 0.05, 0.90, 0.45)))
+                out["bottom"] = self._style_signature_from_image(rgb.crop(crop_box(0.12, 0.45, 0.88, 0.82)))
+                out["outer"] = self._style_signature_from_image(rgb.crop(crop_box(0.06, 0.02, 0.94, 0.60)))
+                out["shoes"] = self._style_signature_from_image(rgb.crop(crop_box(0.15, 0.82, 0.85, 0.99)))
+                left_sig = self._style_signature_from_image(rgb.crop(crop_box(0.00, 0.25, 0.38, 0.80)))
+                right_sig = self._style_signature_from_image(rgb.crop(crop_box(0.62, 0.25, 1.00, 0.80)))
+                bag_rgb = [(a + b) / 2.0 for a, b in zip(left_sig[0], right_sig[0])]
+                bag_sat = (left_sig[1] + right_sig[1]) / 2.0
+                bag_edge = (left_sig[2] + right_sig[2]) / 2.0
+                out["bag"] = (bag_rgb, bag_sat, bag_edge)
+                return out
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _style_similarity_score(
+        query_sig: Optional[tuple[list[float], float, float]],
+        item_sig: tuple[list[float], float, float],
+    ) -> float:
+        if not query_sig:
+            return 0.6
+        q_rgb, q_sat, q_edge = query_sig
+        i_rgb, i_sat, i_edge = item_sig
+        rgb_dist = math.sqrt(sum((a - b) * (a - b) for a, b in zip(q_rgb, i_rgb)))
+        color_score = max(0.0, min(1.0, 1.0 - (rgb_dist / math.sqrt(3.0))))
+        sat_score = max(0.0, 1.0 - abs(q_sat - i_sat))
+        edge_score = max(0.0, 1.0 - abs(q_edge - i_edge))
+        return (0.55 * color_score) + (0.20 * sat_score) + (0.25 * edge_score)
+
     def _embedding_from_url(self, image_url: str, client: Optional["httpx.Client"] = None) -> list[float]:
         if Image is None or httpx is None:
             return []
@@ -1513,21 +1647,24 @@ class JobService:
     def _embedding_from_image(self, img: "Image.Image") -> list[float]:
         rgb = img.convert("RGB")
         hist_img = rgb.resize((96, 96))
-        hist = hist_img.histogram()  # 256*3
+        px = list(hist_img.getdata())
+        # Ignore near-white background pixels common in e-commerce cutouts.
+        masked = [p for p in px if not (p[0] > 245 and p[1] > 245 and p[2] > 245)]
+        if len(masked) < 800:
+            masked = px
         bins_per_channel = 16
-        channel_chunk = 256 // bins_per_channel
-        vec: list[float] = []
-        for c in range(3):
-            offset = c * 256
-            for i in range(bins_per_channel):
-                start = offset + i * channel_chunk
-                end = offset + (i + 1) * channel_chunk
-                vec.append(float(sum(hist[start:end])))
+        channel_chunk = max(1, 256 // bins_per_channel)
+        hist_bins = [[0.0 for _ in range(bins_per_channel)] for _ in range(3)]
+        for r, g, b in masked:
+            hist_bins[0][min(bins_per_channel - 1, r // channel_chunk)] += 1.0
+            hist_bins[1][min(bins_per_channel - 1, g // channel_chunk)] += 1.0
+            hist_bins[2][min(bins_per_channel - 1, b // channel_chunk)] += 1.0
+        vec: list[float] = [v for channel in hist_bins for v in channel]
 
         # Add coarse spatial features for better shape/region discrimination.
         spatial = rgb.resize((8, 8))
-        px = list(spatial.getdata())
-        for r, g, b in px:
+        spatial_px = list(spatial.getdata())
+        for r, g, b in spatial_px:
             vec.extend([r / 255.0, g / 255.0, b / 255.0])
 
         # Add edge distribution to reduce plain color overfitting.
@@ -1542,6 +1679,7 @@ class JobService:
             start = i * edge_chunk
             end = (i + 1) * edge_chunk
             vec.append(float(sum(edge_hist[start:end])))
+
         return self._normalize_vector(vec)
 
     @staticmethod
