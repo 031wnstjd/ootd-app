@@ -84,7 +84,7 @@ ENABLE_REAL_RENDER = os.getenv("ENABLE_REAL_RENDER", "1") == "1"
 YOUTUBE_UPLOAD_REQUIRED = os.getenv("YOUTUBE_UPLOAD_REQUIRED", "0") == "1"
 YOUTUBE_PRIVACY_STATUS = os.getenv("YOUTUBE_PRIVACY_STATUS", "unlisted")
 CATALOG_MIN_IMAGE_SIM = float(os.getenv("CATALOG_MIN_IMAGE_SIM", "0.35"))
-CATALOG_MIN_ITEMS_PER_CATEGORY = int(os.getenv("CATALOG_MIN_ITEMS_PER_CATEGORY", "3"))
+CATALOG_MIN_ITEMS_PER_CATEGORY = int(os.getenv("CATALOG_MIN_ITEMS_PER_CATEGORY", "300"))
 CATALOG_CRAWL_USE_IMAGE_EMBEDDING = os.getenv("CATALOG_CRAWL_USE_IMAGE_EMBEDDING", "0") == "1"
 
 
@@ -296,7 +296,7 @@ class JobService:
                 youtube_upload_status=latest.youtube_upload_status,
             )
 
-    def start_catalog_crawl(self, limit_per_category: int = 30) -> CatalogCrawlJobResponse:
+    def start_catalog_crawl(self, limit_per_category: int = 300) -> CatalogCrawlJobResponse:
         crawl_job_id = uuid4()
         with self._lock:
             job = CrawlJobRecord(crawl_job_id=crawl_job_id, status=CrawlJobStatus.QUEUED)
@@ -727,13 +727,18 @@ class JobService:
                 )
             )
 
-        if len(results) < look_count and not category:
+        missing_required_categories: list[str] = []
+        if not category and required_categories:
+            existing_categories = {item.category for item in results if item.category}
+            missing_required_categories = [req for req in required_categories if req not in existing_categories]
+
+        if (len(results) < look_count or missing_required_categories) and not category:
             # Fallback candidates to avoid empty UX when crawl data is temporarily sparse.
             needed = look_count - len(results)
             existing_product_ids = {item.product_id for item in results if item.product_id}
             existing_categories = {item.category for item in results if item.category}
             fallback = self._fallback_catalog_items()
-            for required_category in required_categories:
+            for required_category in missing_required_categories:
                 if required_category in existing_categories:
                     continue
                 fallback_item = next(
@@ -787,6 +792,11 @@ class JobService:
                     )
                 )
                 needed -= 1
+            if len(results) > look_count:
+                required_set = set(required_categories)
+                must_keep = [row for row in results if row.category in required_set]
+                optional = [row for row in results if row.category not in required_set]
+                results = (must_keep + optional)[:look_count]
         return results
 
     @staticmethod
@@ -863,7 +873,7 @@ class JobService:
     def _crawl_and_index(self, limit_per_category: int) -> tuple[int, int]:
         products: dict[str, CatalogItemRecord] = {}
         seeds = self._catalog_seed_queries()
-        min_per_category = max(1, min(limit_per_category, CATALOG_MIN_ITEMS_PER_CATEGORY))
+        target_per_category = max(1, max(limit_per_category, CATALOG_MIN_ITEMS_PER_CATEGORY))
         if httpx is None or BeautifulSoup is None:
             fallback = self._fallback_catalog_items()
             with self._lock:
@@ -874,11 +884,11 @@ class JobService:
 
         with httpx.Client(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
             for category, query in seeds.items():
-                discovered = self._crawl_goods_api(client, category, query, limit_per_category)
+                discovered = self._crawl_goods_api(client, category, query, target_per_category)
                 if not discovered:
-                    discovered = self._crawl_search_page(client, category, query, limit_per_category)
-                if len(discovered) < min_per_category:
-                    fallback = self._fallback_items_for_category(category, min_per_category - len(discovered))
+                    discovered = self._crawl_search_page(client, category, query, target_per_category)
+                if len(discovered) < target_per_category:
+                    fallback = self._fallback_items_for_category(category, target_per_category - len(discovered))
                     discovered.extend(fallback)
                 for item in discovered:
                     products[item.product_id] = item
@@ -919,7 +929,33 @@ class JobService:
         if needed <= 0:
             return []
         fallback = [item for item in self._fallback_catalog_items() if item.category == category]
-        return fallback[:needed]
+        if len(fallback) >= needed:
+            return fallback[:needed]
+        ko = {
+            "shoes": "신발",
+            "top": "상의",
+            "outer": "아우터",
+            "bottom": "바지",
+            "bag": "가방",
+        }.get(category, category)
+        items = list(fallback)
+        start_idx = len(items) + 1
+        for idx in range(start_idx, needed + 1):
+            query = f"{ko} 코디"
+            url = self._musinsa_search_url(query)
+            items.append(
+                CatalogItemRecord(
+                    product_id=f"fallback-{category}-{idx}",
+                    category=category,
+                    brand="MUSINSA",
+                    product_name=f"{ko} 추천 아이템 {idx}",
+                    product_url=url,
+                    image_url=url,
+                    price=28000 + (idx % 10) * 3000,
+                    embedding=self._embedding_from_text(f"{category} {ko} {idx}"),
+                )
+            )
+        return items[:needed]
 
     def _crawl_goods_api(
         self,
@@ -934,7 +970,8 @@ class JobService:
         page_size = min(60, max(10, limit_count))
         base_url = "https://api.musinsa.com/api2/dp/v1/plp/goods"
 
-        while len(records) < limit_count and page <= 5:
+        max_pages = max(5, math.ceil(limit_count / max(page_size, 1)) + 1)
+        while len(records) < limit_count and page <= max_pages:
             params = {
                 "keyword": keyword,
                 "caller": "SEARCH",

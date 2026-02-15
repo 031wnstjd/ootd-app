@@ -442,7 +442,7 @@ export default function DashboardPage() {
     setCatalogError('');
     setIsCrawling(true);
     try {
-      const started = await startCatalogCrawl(30);
+      const started = await startCatalogCrawl(300);
       const detail = await getCatalogCrawlJob(started.crawl_job_id);
       setCrawlJob(detail);
       await refreshCatalogStats();

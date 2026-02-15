@@ -102,7 +102,7 @@ export async function getMetrics(): Promise<MetricsResponse> {
   return request<MetricsResponse>('/v1/metrics');
 }
 
-export async function startCatalogCrawl(limitPerCategory = 30): Promise<CatalogCrawlJobResponse> {
+export async function startCatalogCrawl(limitPerCategory = 300): Promise<CatalogCrawlJobResponse> {
   const params = new URLSearchParams({ limit_per_category: String(limitPerCategory) });
   return request<CatalogCrawlJobResponse>(`/v1/catalog/crawl/jobs?${params.toString()}`, {
     method: 'POST'
