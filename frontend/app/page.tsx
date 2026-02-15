@@ -261,6 +261,26 @@ export default function DashboardPage() {
     return () => window.clearInterval(timer);
   }, [activeJobId, isPolling]);
 
+  useEffect(() => {
+    if (!crawlJob?.crawl_job_id || crawlJob.status !== 'RUNNING') return;
+
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const detail = await getCatalogCrawlJob(crawlJob.crawl_job_id);
+          setCrawlJob(detail);
+          if (detail.status !== 'RUNNING') {
+            await refreshCatalogStats();
+          }
+        } catch {
+          // keep previous crawl status; user can manually retry refresh
+        }
+      })();
+    }, 2500);
+
+    return () => window.clearInterval(timer);
+  }, [crawlJob?.crawl_job_id, crawlJob?.status]);
+
   async function onCreateJob(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError('');

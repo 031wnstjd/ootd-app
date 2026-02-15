@@ -85,6 +85,7 @@ YOUTUBE_UPLOAD_REQUIRED = os.getenv("YOUTUBE_UPLOAD_REQUIRED", "0") == "1"
 YOUTUBE_PRIVACY_STATUS = os.getenv("YOUTUBE_PRIVACY_STATUS", "unlisted")
 CATALOG_MIN_IMAGE_SIM = float(os.getenv("CATALOG_MIN_IMAGE_SIM", "0.35"))
 CATALOG_MIN_ITEMS_PER_CATEGORY = int(os.getenv("CATALOG_MIN_ITEMS_PER_CATEGORY", "3"))
+CATALOG_CRAWL_USE_IMAGE_EMBEDDING = os.getenv("CATALOG_CRAWL_USE_IMAGE_EMBEDDING", "0") == "1"
 
 
 @dataclass
@@ -884,8 +885,13 @@ class JobService:
 
         indexed = 0
         for item in products.values():
+            # Default to fast text embedding during crawl so catalog becomes usable in seconds.
+            # Real image embedding can be re-enabled with CATALOG_CRAWL_USE_IMAGE_EMBEDDING=1.
             if not item.embedding:
-                item.embedding = self._embedding_from_url(item.image_url)
+                if CATALOG_CRAWL_USE_IMAGE_EMBEDDING:
+                    item.embedding = self._embedding_from_url(item.image_url)
+                else:
+                    item.embedding = self._embedding_from_text(f"{item.category} {item.product_name}")
             if item.embedding:
                 indexed += 1
 
