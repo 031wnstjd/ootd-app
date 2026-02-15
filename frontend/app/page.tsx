@@ -10,6 +10,7 @@ import {
   toApiErrorMessage
 } from '@/lib/api';
 import {
+  FailureCode,
   HistoryItem,
   JobDetailResponse,
   JobStatus,
@@ -37,6 +38,19 @@ const STAGE_ORDER: JobStatus[] = [
   'COMPLETED'
 ];
 
+const RERANK_PRESET_STORAGE_KEY = 'ootd_rerank_presets_v1';
+
+type RerankPreset = {
+  priceCap?: string;
+  colorHint?: string;
+};
+
+type FailureGuide = {
+  title: string;
+  message: string;
+  actionLabel?: string;
+};
+
 function statusTone(status?: JobStatus): string {
   if (!status) return 'text-slate-500';
   if (status === 'FAILED') return 'text-bad';
@@ -60,6 +74,46 @@ function scoreRows(score?: ScoreBreakdown): Array<{ key: string; value: number |
   ];
 }
 
+function failureGuide(code?: FailureCode): FailureGuide | null {
+  if (!code) return null;
+  if (code === 'EMPTY_RESULT') {
+    return {
+      title: 'No Match Result',
+      message: '조건을 완화해서 rerank 하거나 color hint를 추가해 후보를 다시 생성하세요.',
+      actionLabel: 'Retry Match'
+    };
+  }
+  if (code === 'RENDER_ERROR') {
+    return {
+      title: 'Render Failed',
+      message: '렌더 단계에서 실패했습니다. 상태를 새로고침한 뒤 재시도 가능한지 확인하세요.',
+      actionLabel: 'Refresh Status'
+    };
+  }
+  if (code === 'CRAWL_TIMEOUT') {
+    return {
+      title: 'Crawl Timeout',
+      message: '일시적 타임아웃일 수 있습니다. price cap을 완화하고 다시 rerank 해보세요.',
+      actionLabel: 'Retry Match'
+    };
+  }
+  if (code === 'SAFETY_BLOCKED') {
+    return {
+      title: 'Safety Blocked',
+      message: '안전 필터에 의해 차단되었습니다. 보다 보수적인 tone/theme로 새 Job을 생성하세요.',
+      actionLabel: 'Apply Safe Preset'
+    };
+  }
+  if (code === 'LICENSE_BLOCKED') {
+    return {
+      title: 'License Blocked',
+      message: '라이선스 제약으로 중단되었습니다. 다른 스타일 조건으로 새 Job을 시도하세요.',
+      actionLabel: 'Apply Safe Preset'
+    };
+  }
+  return null;
+}
+
 export default function DashboardPage() {
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [lookCount, setLookCount] = useState<number>(3);
@@ -78,6 +132,7 @@ export default function DashboardPage() {
   const [rerankBusyCategory, setRerankBusyCategory] = useState<string>('');
   const [rerankPriceCapByCategory, setRerankPriceCapByCategory] = useState<Record<string, string>>({});
   const [rerankColorHintByCategory, setRerankColorHintByCategory] = useState<Record<string, string>>({});
+  const [savedRerankPresetByCategory, setSavedRerankPresetByCategory] = useState<Record<string, RerankPreset>>({});
 
   const [formError, setFormError] = useState('');
   const [jobError, setJobError] = useState('');
@@ -121,6 +176,17 @@ export default function DashboardPage() {
 
   useEffect(() => {
     void refreshHistory();
+  }, []);
+
+  useEffect(() => {
+    const raw = window.localStorage.getItem(RERANK_PRESET_STORAGE_KEY);
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw) as Record<string, RerankPreset>;
+      setSavedRerankPresetByCategory(parsed);
+    } catch {
+      setSavedRerankPresetByCategory({});
+    }
   }, []);
 
   useEffect(() => {
@@ -196,6 +262,42 @@ export default function DashboardPage() {
 
   function setRerankColorHint(category: string, value: string) {
     setRerankColorHintByCategory((prev) => ({ ...prev, [category]: value }));
+  }
+
+  function persistPreset(nextPresets: Record<string, RerankPreset>) {
+    setSavedRerankPresetByCategory(nextPresets);
+    window.localStorage.setItem(RERANK_PRESET_STORAGE_KEY, JSON.stringify(nextPresets));
+  }
+
+  function onSavePreset(category: string) {
+    const next = {
+      ...savedRerankPresetByCategory,
+      [category]: {
+        priceCap: rerankPriceCapByCategory[category]?.trim() || '',
+        colorHint: rerankColorHintByCategory[category]?.trim() || ''
+      }
+    };
+    persistPreset(next);
+  }
+
+  function onLoadPreset(category: string) {
+    const preset = savedRerankPresetByCategory[category];
+    if (!preset) return;
+    setRerankPriceCap(category, preset.priceCap ?? '');
+    setRerankColorHint(category, preset.colorHint ?? '');
+  }
+
+  function onClearPreset(category: string) {
+    const next = { ...savedRerankPresetByCategory };
+    delete next[category];
+    persistPreset(next);
+    setRerankPriceCap(category, '');
+    setRerankColorHint(category, '');
+  }
+
+  function applySafeCreatePreset() {
+    setTone('clean');
+    setTheme('minimal basic');
   }
 
   async function onApprove() {
@@ -372,6 +474,33 @@ export default function DashboardPage() {
                 </div>
               </div>
 
+              {job.failure_code && (
+                <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm">
+                  <p className="font-medium">{failureGuide(job.failure_code)?.title}</p>
+                  <p className="mt-1 text-slate-700">{failureGuide(job.failure_code)?.message}</p>
+                  <div className="mt-2">
+                    {(job.failure_code === 'EMPTY_RESULT' || job.failure_code === 'RENDER_ERROR') && (
+                      <button
+                        type="button"
+                        onClick={() => activeJobId && void refreshJob(activeJobId)}
+                        className="rounded border border-amber-500 px-3 py-1.5 text-xs font-medium text-amber-700"
+                      >
+                        {failureGuide(job.failure_code)?.actionLabel}
+                      </button>
+                    )}
+                    {(job.failure_code === 'SAFETY_BLOCKED' || job.failure_code === 'LICENSE_BLOCKED') && (
+                      <button
+                        type="button"
+                        onClick={applySafeCreatePreset}
+                        className="rounded border border-amber-500 px-3 py-1.5 text-xs font-medium text-amber-700"
+                      >
+                        {failureGuide(job.failure_code)?.actionLabel}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {canApprove && (
                 <button
                   type="button"
@@ -429,6 +558,38 @@ export default function DashboardPage() {
                     >
                       {rerankBusyCategory === item.category ? 'Reranking...' : 'Rerank'}
                     </button>
+                    <div className="flex gap-1">
+                      <button
+                        type="button"
+                        onClick={() => item.category && onSavePreset(item.category)}
+                        disabled={!item.category}
+                        className="flex-1 rounded border border-slate-300 px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Save
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => item.category && onLoadPreset(item.category)}
+                        disabled={!item.category || !savedRerankPresetByCategory[item.category]}
+                        className="flex-1 rounded border border-slate-300 px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Load
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => item.category && onClearPreset(item.category)}
+                        disabled={!item.category}
+                        className="flex-1 rounded border border-slate-300 px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                    {item.category && savedRerankPresetByCategory[item.category] && (
+                      <p className="text-[11px] text-muted">
+                        preset: cap {savedRerankPresetByCategory[item.category]?.priceCap || '-'} / color{' '}
+                        {savedRerankPresetByCategory[item.category]?.colorHint || '-'}
+                      </p>
+                    )}
                   </div>
                 </div>
 
@@ -453,6 +614,23 @@ export default function DashboardPage() {
                   <a className="text-sm text-accent underline" href={item.product_url} target="_blank" rel="noreferrer">
                     Product link
                   </a>
+                )}
+
+                {item.failure_code && (
+                  <div className="mt-3 rounded border border-amber-300 bg-amber-50 p-2 text-xs">
+                    <p className="font-medium">{failureGuide(item.failure_code)?.title}</p>
+                    <p className="mt-1 text-slate-700">{failureGuide(item.failure_code)?.message}</p>
+                    {(item.failure_code === 'EMPTY_RESULT' || item.failure_code === 'CRAWL_TIMEOUT') && (
+                      <button
+                        type="button"
+                        onClick={() => void onRerank(item)}
+                        disabled={!item.category || rerankBusyCategory === item.category}
+                        className="mt-2 rounded border border-amber-500 px-2 py-1 text-[11px] font-medium text-amber-700 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {failureGuide(item.failure_code)?.actionLabel}
+                      </button>
+                    )}
+                  </div>
                 )}
               </article>
             ))}
