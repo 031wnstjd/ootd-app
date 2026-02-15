@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+      - name: Run backend API tests
+        run: pytest -q
+
+  compose-smoke:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    env:
+      SMOKE_RUNS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure scripts are executable
+        run: chmod +x scripts/preflight-port.sh scripts/compose-smoke.sh
+      - name: Run compose smoke repeatedly
+        run: |
+          mkdir -p artifacts
+          for i in $(seq 1 "$SMOKE_RUNS"); do
+            echo "[INFO] compose smoke run #$i"
+            start_ts=$(date +%s)
+            ./scripts/compose-smoke.sh
+            end_ts=$(date +%s)
+            echo "run=$i duration_sec=$((end_ts - start_ts))" | tee -a artifacts/compose-smoke-runs.txt
+          done
+      - name: Collect compose diagnostics
+        if: always()
+        run: |
+          mkdir -p artifacts
+          docker compose -f docker-compose.yml ps > artifacts/compose-ps.txt || true
+          docker compose -f docker-compose.yml logs --no-color > artifacts/compose-logs.txt || true
+      - name: Upload compose diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-diagnostics
+          path: artifacts
+          if-no-files-found: ignore
+      - name: Teardown compose
+        if: always()
+        run: docker compose -f docker-compose.yml down --remove-orphans
