@@ -49,6 +49,12 @@ const STAGE_ORDER: JobStatus[] = [
 ];
 
 const RERANK_PRESET_STORAGE_KEY = 'ootd_rerank_presets_v1';
+const CATEGORY_LABEL: Record<string, string> = {
+  outer: '아우터',
+  top: '상의',
+  bottom: '하의',
+  shoes: '신발'
+};
 
 type RerankPreset = {
   priceCap?: string;
@@ -124,6 +130,11 @@ function failureGuide(code?: FailureCode): FailureGuide | null {
   return null;
 }
 
+function categoryLabel(category?: string): string {
+  if (!category) return '기타';
+  return CATEGORY_LABEL[category] ?? category;
+}
+
 export default function DashboardPage() {
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [lookCount, setLookCount] = useState<number>(3);
@@ -165,6 +176,15 @@ export default function DashboardPage() {
     const normalized = job.status === 'MATCHED_PARTIAL' ? 'MATCHED' : job.status;
     return STAGE_ORDER.indexOf(normalized);
   }, [job?.status]);
+
+  const groupedItems = useMemo(() => {
+    const items = job?.items ?? [];
+    return {
+      top: items.filter((item) => item.category === 'top'),
+      bottom: items.filter((item) => item.category === 'bottom'),
+      others: items.filter((item) => item.category !== 'top' && item.category !== 'bottom')
+    };
+  }, [job?.items]);
 
   async function refreshHistory() {
     setHistoryError('');
@@ -429,15 +449,16 @@ export default function DashboardPage() {
     <main className="mx-auto min-h-screen max-w-7xl px-8 py-8">
       <header className="mb-6 flex items-end justify-between gap-6">
         <div>
-          <h1 className="text-3xl font-semibold">OOTD Dashboard MVP</h1>
-          <p className="mt-1 text-sm text-muted">Create jobs, monitor status, review match evidence, and approve outputs.</p>
+          <h1 className="text-3xl font-semibold">OOTD Dashboard</h1>
+          <p className="mt-1 text-sm text-muted">Step 1 생성 → Step 2 진행 확인 → Step 3 추천 결과 확인</p>
         </div>
         <p className="text-sm text-muted">API: {process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000'}</p>
       </header>
 
       <section className="grid grid-cols-1 gap-6 xl:grid-cols-[1.2fr_1fr]">
         <form onSubmit={onCreateJob} className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-          <h2 className="mb-4 text-lg font-semibold">Create Job</h2>
+          <h2 className="mb-1 text-lg font-semibold">Step 1. 이미지 업로드 및 Job 생성</h2>
+          <p className="mb-4 text-sm text-muted">사진 1장을 올리고 생성하면 자동으로 상의/하의 추천을 시작합니다.</p>
 
           <label className="mb-4 block text-sm">
             <span className="mb-1 block font-medium">image</span>
@@ -511,7 +532,7 @@ export default function DashboardPage() {
 
         <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
           <div className="mb-4 flex items-center justify-between">
-            <h2 className="text-lg font-semibold">Job Progress</h2>
+            <h2 className="text-lg font-semibold">Step 2. 진행 상태 확인</h2>
             <button
               type="button"
               onClick={() => activeJobId && void refreshJob(activeJobId)}
@@ -655,8 +676,15 @@ export default function DashboardPage() {
       </section>
 
       <section className="mt-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold">Catalog Retrieval Ops</h2>
+        <div className="mb-3">
+          <h2 className="text-lg font-semibold">Advanced Ops</h2>
+          <p className="text-sm text-muted">일반 사용에는 필요 없습니다. 크롤/인덱스 재구축이 필요할 때만 사용하세요.</p>
+        </div>
+        <details>
+          <summary className="cursor-pointer text-sm font-medium text-slate-700">Catalog Retrieval Ops 열기</summary>
+          <div className="mt-4">
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-base font-semibold">Catalog Retrieval Ops</h3>
           <div className="flex gap-2">
             <button
               type="button"
@@ -675,7 +703,7 @@ export default function DashboardPage() {
               {isRebuilding ? 'Rebuilding...' : 'Rebuild Index'}
             </button>
           </div>
-        </div>
+            </div>
         {catalogStats ? (
           <div className="grid grid-cols-2 gap-2 text-sm lg:grid-cols-4">
             <p className="rounded bg-panel px-2 py-1">products: {catalogStats.total_products}</p>
@@ -697,49 +725,96 @@ export default function DashboardPage() {
           </p>
         )}
         {catalogError && <p className="mt-3 text-sm text-bad">{catalogError}</p>}
-      </section>
-
-      <section className="mt-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold">Ops Metrics</h2>
-          <button
-            type="button"
-            onClick={() => void refreshMetrics()}
-            className="rounded-md border border-slate-300 px-3 py-1.5 text-sm"
-          >
-            Refresh
-          </button>
-        </div>
-        {!metrics && <p className="text-sm text-muted">No metrics yet.</p>}
-        {metrics && (
-          <div className="grid grid-cols-2 gap-2 text-sm lg:grid-cols-5">
-            <p className="rounded bg-panel px-2 py-1">created: {metrics.total_jobs_created}</p>
-            <p className="rounded bg-panel px-2 py-1">completed: {metrics.total_jobs_completed}</p>
-            <p className="rounded bg-panel px-2 py-1">failed: {metrics.total_jobs_failed}</p>
-            <p className="rounded bg-panel px-2 py-1">retried: {metrics.total_jobs_retried}</p>
-            <p className="rounded bg-panel px-2 py-1">avg sec: {metrics.avg_processing_seconds.toFixed(3)}</p>
-            <p className="rounded bg-panel px-2 py-1">yt uploaded: {metrics.total_youtube_uploaded}</p>
           </div>
-        )}
-        {metricsError && <p className="mt-3 text-sm text-bad">{metricsError}</p>}
+        </details>
       </section>
 
       <section className="mt-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-        <h2 className="mb-4 text-lg font-semibold">Score Breakdown and Evidence</h2>
+        <details>
+          <summary className="cursor-pointer text-sm font-medium text-slate-700">Ops Metrics 열기</summary>
+          <div className="mt-4">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-lg font-semibold">Ops Metrics</h2>
+              <button
+                type="button"
+                onClick={() => void refreshMetrics()}
+                className="rounded-md border border-slate-300 px-3 py-1.5 text-sm"
+              >
+                Refresh
+              </button>
+            </div>
+            {!metrics && <p className="text-sm text-muted">No metrics yet.</p>}
+            {metrics && (
+              <div className="grid grid-cols-2 gap-2 text-sm lg:grid-cols-5">
+                <p className="rounded bg-panel px-2 py-1">created: {metrics.total_jobs_created}</p>
+                <p className="rounded bg-panel px-2 py-1">completed: {metrics.total_jobs_completed}</p>
+                <p className="rounded bg-panel px-2 py-1">failed: {metrics.total_jobs_failed}</p>
+                <p className="rounded bg-panel px-2 py-1">retried: {metrics.total_jobs_retried}</p>
+                <p className="rounded bg-panel px-2 py-1">avg sec: {metrics.avg_processing_seconds.toFixed(3)}</p>
+                <p className="rounded bg-panel px-2 py-1">yt uploaded: {metrics.total_youtube_uploaded}</p>
+              </div>
+            )}
+            {metricsError && <p className="mt-3 text-sm text-bad">{metricsError}</p>}
+          </div>
+        </details>
+      </section>
+
+      <section className="mt-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+        <h2 className="mb-1 text-lg font-semibold">Step 3. 결과 확인</h2>
+        <p className="mb-4 text-sm text-muted">상의/하의가 각각 최소 1개씩 포함되는지 먼저 확인하세요.</p>
 
         {!job?.items?.length && <p className="text-sm text-muted">No match items yet.</p>}
 
         {job?.items?.length ? (
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-            {job.items.map((item, index) => (
-              <article key={`${item.category ?? 'item'}-${item.product_id ?? index}`} className="rounded-md border border-slate-200 p-4">
+          <div className="space-y-6">
+            {[
+              { key: 'top', title: '상의 추천', items: groupedItems.top },
+              { key: 'bottom', title: '하의 추천', items: groupedItems.bottom },
+              { key: 'others', title: '기타 추천', items: groupedItems.others }
+            ].map((group) => (
+              <div key={group.key}>
+                <div className="mb-2 flex items-center justify-between">
+                  <h3 className="text-base font-semibold">{group.title}</h3>
+                  <span className="text-xs text-muted">{group.items.length} items</span>
+                </div>
+                {!group.items.length && <p className="text-sm text-muted">추천 항목이 없습니다.</p>}
+                <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                  {group.items.map((item, index) => (
+                    <article key={`${item.category ?? 'item'}-${item.product_id ?? index}`} className="rounded-md border border-slate-200 p-4">
                 <div className="mb-2 flex items-start justify-between gap-3">
                   <div>
-                    <p className="text-xs uppercase tracking-wide text-muted">{item.category ?? 'unknown category'}</p>
+                    <p className="text-xs uppercase tracking-wide text-muted">{categoryLabel(item.category)}</p>
                     <p className="font-medium">{item.brand ?? '-'} / {item.product_name ?? '-'}</p>
                     <p className="text-sm text-muted">product_id: {item.product_id ?? '-'}</p>
                   </div>
-                  <div className="w-48 space-y-2">
+                </div>
+
+                <div className="mb-3 grid grid-cols-2 gap-2 text-sm">
+                  {scoreRows(item.score_breakdown).map((row) => (
+                    <p key={`${item.category ?? 'x'}-${row.key}`} className="rounded bg-panel px-2 py-1">
+                      {row.key}: {formatScore(row.value)}
+                    </p>
+                  ))}
+                </div>
+
+                <div className="mb-2 flex flex-wrap gap-2">
+                  {(item.evidence_tags ?? []).map((tag) => (
+                    <span key={`${item.category ?? 'x'}-${tag}`} className="rounded-full bg-slate-200 px-2 py-0.5 text-xs text-slate-700">
+                      {tag}
+                    </span>
+                  ))}
+                  {!item.evidence_tags?.length && <span className="text-xs text-muted">No evidence tags</span>}
+                </div>
+
+                {item.product_url && (
+                  <a className="text-sm text-accent underline" href={item.product_url} target="_blank" rel="noreferrer">
+                    Product link
+                  </a>
+                )}
+
+                <details className="mt-3 rounded border border-slate-200 p-2">
+                  <summary className="cursor-pointer text-xs font-medium text-slate-700">Advanced rerank controls</summary>
+                  <div className="mt-2 space-y-2">
                     <input
                       type="number"
                       min={10000}
@@ -797,30 +872,7 @@ export default function DashboardPage() {
                       </p>
                     )}
                   </div>
-                </div>
-
-                <div className="mb-3 grid grid-cols-2 gap-2 text-sm">
-                  {scoreRows(item.score_breakdown).map((row) => (
-                    <p key={`${item.category ?? 'x'}-${row.key}`} className="rounded bg-panel px-2 py-1">
-                      {row.key}: {formatScore(row.value)}
-                    </p>
-                  ))}
-                </div>
-
-                <div className="mb-2 flex flex-wrap gap-2">
-                  {(item.evidence_tags ?? []).map((tag) => (
-                    <span key={`${item.category ?? 'x'}-${tag}`} className="rounded-full bg-slate-200 px-2 py-0.5 text-xs text-slate-700">
-                      {tag}
-                    </span>
-                  ))}
-                  {!item.evidence_tags?.length && <span className="text-xs text-muted">No evidence tags</span>}
-                </div>
-
-                {item.product_url && (
-                  <a className="text-sm text-accent underline" href={item.product_url} target="_blank" rel="noreferrer">
-                    Product link
-                  </a>
-                )}
+                </details>
 
                 {item.failure_code && (
                   <div className="mt-3 rounded border border-amber-300 bg-amber-50 p-2 text-xs">
@@ -838,15 +890,21 @@ export default function DashboardPage() {
                     )}
                   </div>
                 )}
-              </article>
+                    </article>
+                  ))}
+                </div>
+              </div>
             ))}
           </div>
         ) : null}
       </section>
 
       <section className="mt-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold">History</h2>
+        <details>
+          <summary className="cursor-pointer text-sm font-medium text-slate-700">History 열기</summary>
+          <div className="mt-4">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-lg font-semibold">History</h2>
           <button
             type="button"
             onClick={() => void refreshHistory()}
@@ -855,11 +913,11 @@ export default function DashboardPage() {
           >
             {isRefreshingHistory ? 'Loading...' : 'Reload'}
           </button>
-        </div>
+            </div>
 
-        {!history.length && <p className="text-sm text-muted">No history records.</p>}
+            {!history.length && <p className="text-sm text-muted">No history records.</p>}
 
-        {history.length ? (
+            {history.length ? (
           <div className="overflow-x-auto">
             <table className="w-full min-w-[800px] border-collapse text-sm">
               <thead>
@@ -895,7 +953,9 @@ export default function DashboardPage() {
           </div>
         ) : null}
 
-        {historyError && <p className="mt-3 text-sm text-bad">{historyError}</p>}
+            {historyError && <p className="mt-3 text-sm text-bad">{historyError}</p>}
+          </div>
+        </details>
       </section>
     </main>
   );

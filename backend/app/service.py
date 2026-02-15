@@ -704,7 +704,11 @@ class JobService:
             candidates.append((final, item, score, tags))
 
         candidates.sort(key=lambda row: row[0], reverse=True)
-        top = candidates[:look_count]
+        required_categories = self._required_categories_for_auto_match(look_count, category)
+        if required_categories:
+            top = self._select_balanced_candidates(candidates, look_count, required_categories)
+        else:
+            top = candidates[:look_count]
         results: list[MatchItem] = []
         for idx, (_, item, score, tags) in enumerate(top):
             results.append(
@@ -724,8 +728,48 @@ class JobService:
         if len(results) < look_count and not category:
             # Fallback candidates to avoid empty UX when crawl data is temporarily sparse.
             needed = look_count - len(results)
+            existing_product_ids = {item.product_id for item in results if item.product_id}
+            existing_categories = {item.category for item in results if item.category}
             fallback = self._fallback_catalog_items()
-            for item in fallback[:needed]:
+            for required_category in required_categories:
+                if required_category in existing_categories:
+                    continue
+                fallback_item = next(
+                    (
+                        item
+                        for item in fallback
+                        if item.category == required_category and item.product_id not in existing_product_ids
+                    ),
+                    None,
+                )
+                if not fallback_item or needed <= 0:
+                    continue
+                existing_product_ids.add(fallback_item.product_id)
+                existing_categories.add(fallback_item.category)
+                results.append(
+                    MatchItem(
+                        category=fallback_item.category,
+                        product_id=fallback_item.product_id,
+                        brand=fallback_item.brand,
+                        product_name=fallback_item.product_name,
+                        price=fallback_item.price,
+                        product_url=fallback_item.product_url,
+                        image_url=fallback_item.image_url,
+                        evidence_tags=["fallback:required-category", f"required:{required_category}"],
+                        score_breakdown=ScoreBreakdown(image=0.45, text=0.5, category=0.7, price=0.5, final=0.52),
+                        failure_code=FailureCode.CRAWL_TIMEOUT,
+                    )
+                )
+                needed -= 1
+                if needed <= 0:
+                    break
+
+            for item in fallback:
+                if needed <= 0:
+                    break
+                if item.product_id in existing_product_ids:
+                    continue
+                existing_product_ids.add(item.product_id)
                 results.append(
                     MatchItem(
                         category=item.category,
@@ -740,7 +784,49 @@ class JobService:
                         failure_code=FailureCode.CRAWL_TIMEOUT,
                     )
                 )
+                needed -= 1
         return results
+
+    @staticmethod
+    def _required_categories_for_auto_match(look_count: int, category: Optional[str]) -> list[str]:
+        if category is not None:
+            return []
+        if look_count < 2:
+            return []
+        return ["top", "bottom"]
+
+    @staticmethod
+    def _select_balanced_candidates(
+        candidates: list[tuple[float, CatalogItemRecord, ScoreBreakdown, list[str]]],
+        look_count: int,
+        required_categories: list[str],
+    ) -> list[tuple[float, CatalogItemRecord, ScoreBreakdown, list[str]]]:
+        selected: list[tuple[float, CatalogItemRecord, ScoreBreakdown, list[str]]] = []
+        used_product_ids: set[str] = set()
+
+        for required_category in required_categories:
+            picked = next(
+                (
+                    row
+                    for row in candidates
+                    if row[1].category == required_category and row[1].product_id not in used_product_ids
+                ),
+                None,
+            )
+            if picked is None:
+                continue
+            selected.append(picked)
+            used_product_ids.add(picked[1].product_id)
+
+        for row in candidates:
+            if len(selected) >= look_count:
+                break
+            if row[1].product_id in used_product_ids:
+                continue
+            selected.append(row)
+            used_product_ids.add(row[1].product_id)
+
+        return selected[:look_count]
 
     def _run_catalog_crawl(self, crawl_job_id: UUID, limit_per_category: int) -> None:
         with self._lock:

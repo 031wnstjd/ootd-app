@@ -94,6 +94,9 @@ def test_auto_gate_job_progresses_and_history(client: TestClient, monkeypatch: p
     assert len(detail["items"]) == 3
     for item in detail["items"]:
         _assert_match_item_shape(item)
+    categories = {item["category"] for item in detail["items"]}
+    assert "top" in categories
+    assert "bottom" in categories
 
     history = client.get("/v1/history?limit=1")
     assert history.status_code == 200
@@ -112,6 +115,9 @@ def test_human_review_requires_approval(client: TestClient, monkeypatch: pytest.
     assert detail["progress"] == 95
     assert detail["video_url"].endswith(f"/assets/videos/{job_id}.mp4")
     assert len(detail["items"]) == 2
+    categories = {item["category"] for item in detail["items"]}
+    assert "top" in categories
+    assert "bottom" in categories
 
     approval = client.post(f"/v1/jobs/{job_id}/approve")
     assert approval.status_code == 200
