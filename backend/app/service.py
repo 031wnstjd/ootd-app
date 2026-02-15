@@ -85,7 +85,7 @@ YOUTUBE_UPLOAD_REQUIRED = os.getenv("YOUTUBE_UPLOAD_REQUIRED", "0") == "1"
 YOUTUBE_PRIVACY_STATUS = os.getenv("YOUTUBE_PRIVACY_STATUS", "unlisted")
 CATALOG_MIN_IMAGE_SIM = float(os.getenv("CATALOG_MIN_IMAGE_SIM", "0.35"))
 CATALOG_MIN_ITEMS_PER_CATEGORY = int(os.getenv("CATALOG_MIN_ITEMS_PER_CATEGORY", "300"))
-CATALOG_CRAWL_USE_IMAGE_EMBEDDING = os.getenv("CATALOG_CRAWL_USE_IMAGE_EMBEDDING", "0") == "1"
+CATALOG_CRAWL_USE_IMAGE_EMBEDDING = os.getenv("CATALOG_CRAWL_USE_IMAGE_EMBEDDING", "1") == "1"
 
 
 @dataclass
@@ -473,9 +473,10 @@ class JobService:
             upload_image_path = rec.upload_image_path
             tone = rec.tone
             theme = rec.theme
+            effective_look_count = self._effective_auto_match_count(look_count, category=None)
         matched_items = self._search_catalog(
             upload_image_path=upload_image_path,
-            look_count=look_count,
+            look_count=effective_look_count,
             category=None,
             price_cap=None,
             color_hint=tone or theme,
@@ -484,7 +485,7 @@ class JobService:
             rec = self._jobs.get(job_id)
             if not rec:
                 return
-            rec.had_partial_match = len(matched_items) < rec.look_count or rec.look_count >= 4
+            rec.had_partial_match = len(matched_items) < effective_look_count or effective_look_count >= 4
             if rec.had_partial_match and matched_items:
                 matched_items[-1].failure_code = FailureCode.CRAWL_TIMEOUT
             rec.status = JobStatus.MATCHED_PARTIAL if rec.had_partial_match else JobStatus.MATCHED
@@ -665,6 +666,7 @@ class JobService:
         price_cap: Optional[int],
         color_hint: Optional[str],
     ) -> list[MatchItem]:
+        effective_look_count = self._effective_auto_match_count(look_count, category)
         query_vector = self._embedding_from_file(upload_image_path) if upload_image_path else []
         if not query_vector:
             query_vector = self._embedding_from_text(color_hint or "street casual")
@@ -706,11 +708,11 @@ class JobService:
             candidates.append((final, item, score, tags))
 
         candidates.sort(key=lambda row: row[0], reverse=True)
-        required_categories = self._required_categories_for_auto_match(look_count, category)
+        required_categories = self._required_categories_for_auto_match(effective_look_count, category)
         if required_categories:
-            top = self._select_balanced_candidates(candidates, look_count, required_categories)
+            top = self._select_balanced_candidates(candidates, effective_look_count, required_categories)
         else:
-            top = candidates[:look_count]
+            top = candidates[:effective_look_count]
         results: list[MatchItem] = []
         for idx, (_, item, score, tags) in enumerate(top):
             results.append(
@@ -732,9 +734,9 @@ class JobService:
             existing_categories = {item.category for item in results if item.category}
             missing_required_categories = [req for req in required_categories if req not in existing_categories]
 
-        if (len(results) < look_count or missing_required_categories) and not category:
+        if (len(results) < effective_look_count or missing_required_categories) and not category:
             # Fallback candidates to avoid empty UX when crawl data is temporarily sparse.
-            needed = look_count - len(results)
+            needed = effective_look_count - len(results)
             existing_product_ids = {item.product_id for item in results if item.product_id}
             existing_categories = {item.category for item in results if item.category}
             fallback = self._fallback_catalog_items()
@@ -792,12 +794,19 @@ class JobService:
                     )
                 )
                 needed -= 1
-            if len(results) > look_count:
+            if len(results) > effective_look_count:
                 required_set = set(required_categories)
                 must_keep = [row for row in results if row.category in required_set]
                 optional = [row for row in results if row.category not in required_set]
-                results = (must_keep + optional)[:look_count]
+                results = (must_keep + optional)[:effective_look_count]
         return results
+
+    @staticmethod
+    def _effective_auto_match_count(look_count: int, category: Optional[str]) -> int:
+        if category is not None:
+            return max(1, look_count)
+        # Outfit recommendation must include both top and bottom even if user selected 1.
+        return max(2, look_count)
 
     @staticmethod
     def _required_categories_for_auto_match(look_count: int, category: Optional[str]) -> list[str]:
@@ -895,12 +904,10 @@ class JobService:
 
         indexed = 0
         for item in products.values():
-            # Default to fast text embedding during crawl so catalog becomes usable in seconds.
-            # Real image embedding can be re-enabled with CATALOG_CRAWL_USE_IMAGE_EMBEDDING=1.
             if not item.embedding:
                 if CATALOG_CRAWL_USE_IMAGE_EMBEDDING:
                     item.embedding = self._embedding_from_url(item.image_url)
-                else:
+                if not item.embedding:
                     item.embedding = self._embedding_from_text(f"{item.category} {item.product_name}")
             if item.embedding:
                 indexed += 1
@@ -1171,7 +1178,7 @@ class JobService:
         cache_path = self._catalog_cache_dir / f"{self._product_id_from_url(image_url)}.img"
         try:
             if not cache_path.exists():
-                with httpx.Client(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+                with httpx.Client(timeout=4.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
                     resp = client.get(image_url)
                     if resp.status_code != 200 or not resp.content:
                         return []
