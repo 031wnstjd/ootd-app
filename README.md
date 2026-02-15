@@ -135,6 +135,19 @@ docker run --rm -v "$PWD":/work alpine sh -lc "chown -R $(id -u):$(id -g) /work/
 - 카탈로그가 비어 있거나 외부 수집이 실패하면 검색 링크 기반 fallback 후보를 반환합니다.
 - `CATALOG_MIN_IMAGE_SIM` (default `0.35`)로 최소 이미지 유사도 임계값을 조정할 수 있습니다.
 
+## Export Crawled Images As JPG Dataset
+
+크롤링 캐시(`data/assets/catalog-cache/*.img`)를 사람이 확인 가능한 JPG 데이터셋으로 내보냅니다.
+
+```bash
+cd /home/junsung/vibe_coding/lookbook-app/ootd-app
+python3 scripts/export_catalog_jpg_dataset.py
+```
+
+- 출력 폴더: `datasets/catalog-jpg/`
+- 카테고리별 하위 폴더 + `manifest.csv` 생성
+- 기본값은 `fallback-*` 항목 제외 (`--include-fallback` 옵션으로 포함 가능)
+
 ## Real Product/Video Notes
 
 - 상품 링크는 더 이상 `store.example.com`을 사용하지 않고, 무신사 검색 URL로 생성됩니다.
