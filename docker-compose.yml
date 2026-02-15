@@ -6,6 +6,11 @@ services:
       - ./:/app
     environment:
       - JOB_STATE_FILE=/app/data/job_state.json
+      - ASSET_ROOT=/app/data/assets
+      - PUBLIC_BASE_URL=http://localhost:8000
+      - ENABLE_REAL_RENDER=1
+      - YOUTUBE_UPLOAD_REQUIRED=0
+      - YOUTUBE_PRIVACY_STATUS=unlisted
     command: >
       bash -lc "pip install -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     ports:

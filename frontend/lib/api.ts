@@ -5,6 +5,7 @@ import {
   HistoryResponse,
   JobDetailResponse,
   MetricsResponse,
+  PublishResponse,
   RerankRequest,
   RerankResponse,
   RetryResponse
@@ -78,6 +79,12 @@ export async function approveJob(jobId: string): Promise<ApproveResponse> {
 
 export async function retryJob(jobId: string): Promise<RetryResponse> {
   return request<RetryResponse>(`/v1/jobs/${jobId}/retry`, {
+    method: 'POST'
+  });
+}
+
+export async function publishJob(jobId: string): Promise<PublishResponse> {
+  return request<PublishResponse>(`/v1/jobs/${jobId}/publish`, {
     method: 'POST'
   });
 }

@@ -8,6 +8,7 @@
 - Frontend: Next.js + Tailwind (`frontend/`)
 - API Contract: `openapi.yaml`
 - Persistence: JSON state file (`JOB_STATE_FILE`, default `./data/job_state.json`)
+- Assets: rendered/output files (`ASSET_ROOT`, default `./data/assets`)
 
 ## Run (Local)
 
@@ -118,6 +119,31 @@ docker run --rm -v "$PWD":/work alpine sh -lc "chown -R $(id -u):$(id -g) /work/
 - `POST /v1/jobs/{job_id}/rerank`
 - `POST /v1/jobs/{job_id}/approve`
 - `POST /v1/jobs/{job_id}/retry`
+- `POST /v1/jobs/{job_id}/publish`
 - `GET /v1/history`
 - `GET /healthz`
 - `GET /v1/metrics`
+
+## Real Product/Video Notes
+
+- 상품 링크는 더 이상 `store.example.com`을 사용하지 않고, 무신사 검색 URL로 생성됩니다.
+- `video_url`은 백엔드가 실제로 생성한 mp4 파일(`./data/assets/videos`)을 가리킵니다.
+
+## YouTube Upload Setup
+
+자동 업로드 또는 `Publish to YouTube` 버튼 사용을 위해 아래 환경변수가 필요합니다.
+
+- `YOUTUBE_CLIENT_ID`
+- `YOUTUBE_CLIENT_SECRET`
+- `YOUTUBE_REFRESH_TOKEN`
+- `YOUTUBE_PRIVACY_STATUS` (`private|unlisted|public`, default `unlisted`)
+- `YOUTUBE_UPLOAD_REQUIRED` (`1`이면 업로드 실패 시 job을 실패 처리)
+
+예시:
+
+```bash
+export YOUTUBE_CLIENT_ID=\"...\"
+export YOUTUBE_CLIENT_SECRET=\"...\"
+export YOUTUBE_REFRESH_TOKEN=\"...\"
+export YOUTUBE_PRIVACY_STATUS=\"unlisted\"
+```

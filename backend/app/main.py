@@ -4,6 +4,7 @@ from uuid import UUID
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from .models import (
     ApproveResponse,
@@ -12,6 +13,7 @@ from .models import (
     HistoryResponse,
     JobDetailResponse,
     MetricsResponse,
+    PublishResponse,
     QualityMode,
     RerankRequest,
     RerankResponse,
@@ -21,6 +23,7 @@ from .service import JobService
 
 app = FastAPI(title="Musinsa Shorts Generator API", version="1.0.0")
 service = JobService()
+app.mount("/assets", StaticFiles(directory=str(service.asset_root), check_dir=False), name="assets")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -48,6 +51,8 @@ async def create_job(
         quality_mode=quality_mode,
         theme=theme,
         tone=tone,
+        image_bytes=content,
+        image_content_type=image.content_type,
         idempotency_key=idempotency_key,
     )
 
@@ -70,6 +75,11 @@ async def approve_job(job_id: UUID) -> ApproveResponse:
 @app.post("/v1/jobs/{job_id}/retry", response_model=RetryResponse, status_code=202)
 async def retry_job(job_id: UUID) -> RetryResponse:
     return service.retry(job_id)
+
+
+@app.post("/v1/jobs/{job_id}/publish", response_model=PublishResponse)
+async def publish_job(job_id: UUID) -> PublishResponse:
+    return service.publish_youtube(job_id)
 
 
 @app.get("/v1/history", response_model=HistoryResponse)

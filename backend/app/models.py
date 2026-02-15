@@ -33,6 +33,13 @@ class FailureCode(str, Enum):
     LICENSE_BLOCKED = "LICENSE_BLOCKED"
 
 
+class YouTubeUploadStatus(str, Enum):
+    PENDING = "PENDING"
+    SKIPPED = "SKIPPED"
+    UPLOADED = "UPLOADED"
+    FAILED = "FAILED"
+
+
 class ScoreBreakdown(BaseModel):
     image: float
     text: float
@@ -72,6 +79,9 @@ class JobDetailResponse(BaseModel):
     failure_code: Optional[FailureCode] = None
     parent_job_id: Optional[UUID] = None
     attempts: int = 1
+    youtube_video_id: Optional[str] = None
+    youtube_url: Optional[str] = None
+    youtube_upload_status: Optional[YouTubeUploadStatus] = None
 
 
 class RerankRequest(BaseModel):
@@ -99,6 +109,13 @@ class RetryResponse(BaseModel):
     status: JobStatus
 
 
+class PublishResponse(BaseModel):
+    job_id: UUID
+    youtube_video_id: str
+    youtube_url: str
+    youtube_upload_status: YouTubeUploadStatus
+
+
 class HealthResponse(BaseModel):
     status: str
     uptime_seconds: int
@@ -111,6 +128,7 @@ class MetricsResponse(BaseModel):
     total_jobs_failed: int
     total_jobs_retried: int
     avg_processing_seconds: float
+    total_youtube_uploaded: int = 0
 
 
 class HistoryItem(BaseModel):

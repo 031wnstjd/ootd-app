@@ -7,6 +7,7 @@ import {
   getMetrics,
   getJob,
   listHistory,
+  publishJob,
   rerankJob,
   retryJob,
   toApiErrorMessage
@@ -134,6 +135,7 @@ export default function DashboardPage() {
   const [isRefreshingHistory, setIsRefreshingHistory] = useState(false);
   const [isApproving, setIsApproving] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
+  const [isPublishing, setIsPublishing] = useState(false);
   const [rerankBusyCategory, setRerankBusyCategory] = useState<string>('');
   const [rerankPriceCapByCategory, setRerankPriceCapByCategory] = useState<Record<string, string>>({});
   const [rerankColorHintByCategory, setRerankColorHintByCategory] = useState<Record<string, string>>({});
@@ -358,6 +360,21 @@ export default function DashboardPage() {
     }
   }
 
+  async function onPublishYoutube() {
+    if (!job?.job_id) return;
+    setJobError('');
+    setIsPublishing(true);
+    try {
+      await publishJob(job.job_id);
+      await refreshJob(job.job_id);
+      await refreshMetrics();
+    } catch (err) {
+      setJobError(toApiErrorMessage(err));
+    } finally {
+      setIsPublishing(false);
+    }
+  }
+
   return (
     <main className="mx-auto min-h-screen max-w-7xl px-8 py-8">
       <header className="mb-6 flex items-end justify-between gap-6">
@@ -508,6 +525,17 @@ export default function DashboardPage() {
                       '-'
                     )}
                   </p>
+                  <p>youtube_upload_status: {job.youtube_upload_status ?? '-'}</p>
+                  <p>
+                    youtube_url:{' '}
+                    {job.youtube_url ? (
+                      <a className="text-accent underline" href={job.youtube_url} target="_blank" rel="noreferrer">
+                        open
+                      </a>
+                    ) : (
+                      '-'
+                    )}
+                  </p>
                   <p>failure_code: {job.failure_code ?? '-'}</p>
                 </div>
               </div>
@@ -559,6 +587,16 @@ export default function DashboardPage() {
                   {isRetrying ? 'Retrying...' : 'Retry Failed Job'}
                 </button>
               )}
+              {(job.status === 'COMPLETED' || job.status === 'REVIEW_REQUIRED') && (
+                <button
+                  type="button"
+                  onClick={() => void onPublishYoutube()}
+                  disabled={isPublishing}
+                  className="rounded-md border border-accent px-4 py-2 text-sm font-medium text-accent disabled:opacity-50"
+                >
+                  {isPublishing ? 'Publishing...' : 'Publish to YouTube'}
+                </button>
+              )}
             </div>
           )}
 
@@ -585,6 +623,7 @@ export default function DashboardPage() {
             <p className="rounded bg-panel px-2 py-1">failed: {metrics.total_jobs_failed}</p>
             <p className="rounded bg-panel px-2 py-1">retried: {metrics.total_jobs_retried}</p>
             <p className="rounded bg-panel px-2 py-1">avg sec: {metrics.avg_processing_seconds.toFixed(3)}</p>
+            <p className="rounded bg-panel px-2 py-1">yt uploaded: {metrics.total_youtube_uploaded}</p>
           </div>
         )}
         {metricsError && <p className="mt-3 text-sm text-bad">{metricsError}</p>}

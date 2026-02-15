@@ -18,6 +18,8 @@ export type FailureCode =
   | 'SAFETY_BLOCKED'
   | 'LICENSE_BLOCKED';
 
+export type YouTubeUploadStatus = 'PENDING' | 'SKIPPED' | 'UPLOADED' | 'FAILED';
+
 export interface ScoreBreakdown {
   image: number;
   text: number;
@@ -57,6 +59,9 @@ export interface JobDetailResponse {
   failure_code?: FailureCode;
   parent_job_id?: string;
   attempts?: number;
+  youtube_video_id?: string;
+  youtube_url?: string;
+  youtube_upload_status?: YouTubeUploadStatus;
 }
 
 export interface RerankRequest {
@@ -84,6 +89,13 @@ export interface RetryResponse {
   status: JobStatus;
 }
 
+export interface PublishResponse {
+  job_id: string;
+  youtube_video_id: string;
+  youtube_url: string;
+  youtube_upload_status: YouTubeUploadStatus;
+}
+
 export interface HistoryItem {
   job_id?: string;
   status?: JobStatus;
@@ -102,6 +114,7 @@ export interface MetricsResponse {
   total_jobs_failed: number;
   total_jobs_retried: number;
   avg_processing_seconds: number;
+  total_youtube_uploaded: number;
 }
 
 export interface CreateJobInput {

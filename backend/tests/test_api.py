@@ -17,7 +17,7 @@ from app.service import JobService
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     state_file = Path(tempfile.mkdtemp(prefix="jobservice-test-")) / "job_state.json"
-    monkeypatch.setattr(api_main, "service", JobService(state_file=state_file))
+    monkeypatch.setattr(api_main, "service", JobService(state_file=state_file, enable_real_render=False))
     return TestClient(api_main.app)
 
 
@@ -90,7 +90,7 @@ def test_auto_gate_job_progresses_and_history(client: TestClient, monkeypatch: p
     assert detail["look_count"] == 3
     assert detail["quality_mode"] == "auto_gate"
     assert detail["progress"] == 100
-    assert detail["video_url"].endswith(f"/{job_id}.mp4")
+    assert detail["video_url"].endswith(f"/assets/videos/{job_id}.mp4")
     assert len(detail["items"]) == 3
     for item in detail["items"]:
         _assert_match_item_shape(item)
@@ -110,7 +110,7 @@ def test_human_review_requires_approval(client: TestClient, monkeypatch: pytest.
     _assert_job_detail_shape(detail)
     assert detail["status"] == JobStatus.REVIEW_REQUIRED.value
     assert detail["progress"] == 95
-    assert detail["video_url"].endswith(f"/{job_id}.mp4")
+    assert detail["video_url"].endswith(f"/assets/videos/{job_id}.mp4")
     assert len(detail["items"]) == 2
 
     approval = client.post(f"/v1/jobs/{job_id}/approve")
@@ -118,7 +118,7 @@ def test_human_review_requires_approval(client: TestClient, monkeypatch: pytest.
     body = approval.json()
     assert body["job_id"] == job_id
     assert body["status"] == JobStatus.COMPLETED.value
-    assert body["video_url"].endswith(f"/{job_id}.mp4")
+    assert body["video_url"].endswith(f"/assets/videos/{job_id}.mp4")
 
 
 def test_partial_match_failure_and_rerank(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -393,6 +393,16 @@ def test_health_and_metrics_endpoints(client: TestClient, monkeypatch: pytest.Mo
     assert metrics_body["total_jobs_created"] >= 1
     assert metrics_body["total_jobs_completed"] >= 1
     assert metrics_body["avg_processing_seconds"] >= 0
+    assert metrics_body["total_youtube_uploaded"] >= 0
+
+
+def test_publish_endpoint_requires_youtube_credentials(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.service.random.random", lambda: 0.99)
+    job_id = _create_job(client, quality_mode="auto_gate", look_count=2)
+    _wait_for_terminal(client, job_id)
+
+    publish = client.post(f"/v1/jobs/{job_id}/publish")
+    assert publish.status_code == 409
 
 
 def test_history_default_limit_and_valid_limit(client: TestClient) -> None:
