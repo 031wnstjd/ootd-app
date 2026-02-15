@@ -1,0 +1,11 @@
+services:
+  backend:
+    build:
+      args:
+        TORCH_FLAVOR: ${TORCH_FLAVOR:-cu118}
+    gpus: all
+    environment:
+      - SEMANTIC_EMBEDDING_BACKEND=${SEMANTIC_EMBEDDING_BACKEND:-clip}
+      - CLIP_DEVICE=${CLIP_DEVICE:-cuda}
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}

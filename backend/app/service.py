@@ -87,6 +87,14 @@ except Exception:  # pragma: no cover
     QdrantClient = None  # type: ignore[assignment]
     qdrant_models = None  # type: ignore[assignment]
 
+try:
+    import torch
+    from transformers import CLIPModel, CLIPProcessor
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+    CLIPModel = None  # type: ignore[assignment]
+    CLIPProcessor = None  # type: ignore[assignment]
+
 
 STEP_SECONDS = 0.05
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -115,6 +123,9 @@ QDRANT_TIMEOUT_SECONDS = float(os.getenv("QDRANT_TIMEOUT_SECONDS", "10"))
 QDRANT_UPSERT_BATCH_SIZE = int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", "200"))
 CATEGORY_QUERY_PRIORITY = ["top", "bottom", "outer", "shoes", "bag"]
 DEFAULT_TARGET_GENDER = os.getenv("DEFAULT_TARGET_GENDER", "men")
+SEMANTIC_EMBEDDING_BACKEND = os.getenv("SEMANTIC_EMBEDDING_BACKEND", "clip").strip().lower()
+CLIP_MODEL_NAME = os.getenv("CLIP_MODEL_NAME", "openai/clip-vit-base-patch16")
+CLIP_DEVICE = os.getenv("CLIP_DEVICE", "auto").strip().lower()
 GENDER_MEN_TOKENS = [
     "남성",
     "남자",
@@ -241,6 +252,13 @@ class JobService:
         self._last_incremental_at: Optional[datetime] = None
         self._last_full_reindex_at: Optional[datetime] = None
         self._item_style_signature_cache: dict[str, tuple[list[float], float, float]] = {}
+        self._item_semantic_embedding_cache: dict[str, list[float]] = {}
+        self._semantic_backend = SEMANTIC_EMBEDDING_BACKEND
+        self._semantic_model = None
+        self._semantic_processor = None
+        self._semantic_device = "cpu"
+        self._semantic_model_ready = False
+        self._semantic_lock = threading.Lock()
         self._qdrant_client = self._init_qdrant_client()
         self._uploads_dir.mkdir(parents=True, exist_ok=True)
         self._previews_dir.mkdir(parents=True, exist_ok=True)
@@ -776,6 +794,7 @@ class JobService:
     ) -> tuple[list[MatchItem], dict[str, RoiRegion]]:
         effective_look_count = self._effective_auto_match_count(look_count, category)
         query_vectors, roi_debug = self._query_vectors_by_category(upload_image_path)
+        semantic_query_vectors = self._query_semantic_vectors_by_category(upload_image_path)
         query_style = self._query_style_signatures_by_category(upload_image_path)
         global_query_vector = query_vectors.get("global", [])
         if not global_query_vector:
@@ -817,8 +836,12 @@ class JobService:
             if not item_query:
                 item_query = global_query_vector
             image_sim = self._cosine_similarity(item_query, item.embedding)
+            semantic_sim = self._semantic_similarity(item=item, category=item.category, query_vectors=semantic_query_vectors)
+            blended_image_sim = image_sim
+            if semantic_sim > 0:
+                blended_image_sim = (0.45 * image_sim) + (0.55 * semantic_sim)
             min_image_sim = 0.0 if item.product_id.startswith("fallback-") else CATALOG_MIN_IMAGE_SIM
-            if image_sim < min_image_sim:
+            if blended_image_sim < min_image_sim:
                 continue
             text_score = 0.0
             category_score = 1.0 if category and item.category == category else 0.8
@@ -845,14 +868,14 @@ class JobService:
             )
             meta_score = (0.58 * style_score) + (0.22 * color_score) + (0.20 * attr_score)
             final = (
-                (0.54 * image_sim)
+                (0.54 * blended_image_sim)
                 + (0.18 * style_score)
                 + (0.20 * color_score)
                 + (0.06 * attr_score)
                 + (0.02 * price_score)
             ) * style_penalty
             score = ScoreBreakdown(
-                image=round(image_sim, 4),
+                image=round(blended_image_sim, 4),
                 text=round(text_score, 4),
                 category=round(category_score, 4),
                 price=round(price_score, 4),
@@ -880,6 +903,8 @@ class JobService:
                 tags.append(f"color:{color_hint_text}")
             if style_penalty < 0.999:
                 tags.append("rerank:target-style-penalty")
+            if semantic_sim > 0:
+                tags.append(f"rerank:semantic-{self._semantic_backend}")
             candidates.append((final, item, score, tags))
 
         candidates.sort(key=lambda row: row[0], reverse=True)
@@ -1022,6 +1047,53 @@ class JobService:
                 return vectors, regions
         except Exception:
             return {}, {}
+
+    def _query_semantic_vectors_by_category(self, upload_image_path: Optional[str]) -> dict[str, list[float]]:
+        if self._semantic_backend != "clip":
+            return {}
+        if not upload_image_path or Image is None:
+            return {}
+        path = Path(upload_image_path)
+        if not path.exists():
+            return {}
+        try:
+            with Image.open(path) as img:
+                rgb = img.convert("RGB")
+                width, height = rgb.size
+                if width < 16 or height < 16:
+                    return {"global": self._semantic_embedding_from_image(rgb)}
+
+                def crop_box(x1: float, y1: float, x2: float, y2: float) -> tuple[int, int, int, int]:
+                    left = max(0, min(width - 1, int(width * x1)))
+                    top = max(0, min(height - 1, int(height * y1)))
+                    right = max(left + 1, min(width, int(width * x2)))
+                    bottom = max(top + 1, min(height, int(height * y2)))
+                    return (left, top, right, bottom)
+
+                out: dict[str, list[float]] = {}
+                out["global"] = self._semantic_embedding_from_image(rgb)
+                out["top"] = self._semantic_embedding_from_image(rgb.crop(crop_box(0.10, 0.05, 0.90, 0.46)))
+                out["bottom"] = self._semantic_embedding_from_image(rgb.crop(crop_box(0.16, 0.40, 0.84, 0.78)))
+                out["outer"] = self._semantic_embedding_from_image(rgb.crop(crop_box(0.06, 0.02, 0.94, 0.60)))
+                out["shoes"] = self._semantic_embedding_from_image(rgb.crop(crop_box(0.15, 0.80, 0.85, 0.99)))
+                left_sem = self._semantic_embedding_from_image(rgb.crop(crop_box(0.00, 0.25, 0.38, 0.80)))
+                right_sem = self._semantic_embedding_from_image(rgb.crop(crop_box(0.62, 0.25, 1.00, 0.80)))
+                if left_sem and right_sem and len(left_sem) == len(right_sem):
+                    out["bag"] = self._normalize_vector([(a + b) / 2.0 for a, b in zip(left_sem, right_sem)])
+                else:
+                    out["bag"] = out["global"]
+                return out
+        except Exception:
+            return {}
+
+    def _semantic_similarity(self, item: CatalogItemRecord, category: str, query_vectors: dict[str, list[float]]) -> float:
+        if self._semantic_backend != "clip":
+            return 0.0
+        query_vec = query_vectors.get(category) or query_vectors.get("global") or []
+        if not query_vec:
+            return 0.0
+        item_vec = self._item_semantic_embedding(item)
+        return self._cosine_similarity(query_vec, item_vec)
 
     @staticmethod
     def _effective_auto_match_count(look_count: int, category: Optional[str]) -> int:
@@ -1168,6 +1240,8 @@ class JobService:
         with self._lock:
             if mode == CrawlMode.full:
                 self._catalog = {}
+                self._item_style_signature_cache = {}
+                self._item_semantic_embedding_cache = {}
             self._catalog.update(products)
             snapshot = list(self._catalog.values())
             self._sync_qdrant(snapshot, mode=mode)
@@ -1277,7 +1351,28 @@ class JobService:
         limit: int,
     ) -> list[CatalogItemRecord]:
         if self._qdrant_client is None or qdrant_models is None:
-            return fallback_items
+            if category:
+                scoped = [item for item in fallback_items if item.category == category]
+                if scoped:
+                    return scoped[: max(200, limit * 4)]
+                return fallback_items[: max(200, limit * 4)]
+            target_categories = preferred_categories or CATEGORY_QUERY_PRIORITY
+            per_category = max(120, limit // max(1, len(target_categories)) * 5)
+            selected: list[CatalogItemRecord] = []
+            seen: set[str] = set()
+            for cat in target_categories:
+                count = 0
+                for item in fallback_items:
+                    if item.product_id in seen or item.category != cat:
+                        continue
+                    selected.append(item)
+                    seen.add(item.product_id)
+                    count += 1
+                    if count >= per_category:
+                        break
+            if selected:
+                return selected[: max(limit * 6, 500)]
+            return fallback_items[: max(limit * 6, 500)]
         by_id = {item.product_id: item for item in fallback_items}
         seen: set[str] = set()
         candidates: list[CatalogItemRecord] = []
@@ -1971,6 +2066,74 @@ class JobService:
         sat_score = max(0.0, 1.0 - abs(q_sat - i_sat))
         edge_score = max(0.0, 1.0 - abs(q_edge - i_edge))
         return (0.55 * color_score) + (0.20 * sat_score) + (0.25 * edge_score)
+
+    def _ensure_semantic_model(self) -> bool:
+        if self._semantic_backend != "clip":
+            return False
+        if self._semantic_model_ready:
+            return self._semantic_model is not None and self._semantic_processor is not None
+        with self._semantic_lock:
+            if self._semantic_model_ready:
+                return self._semantic_model is not None and self._semantic_processor is not None
+            if torch is None or CLIPModel is None or CLIPProcessor is None:
+                self._semantic_model_ready = True
+                return False
+            device = "cpu"
+            try:
+                if CLIP_DEVICE == "cuda":
+                    device = "cuda"
+                elif CLIP_DEVICE == "cpu":
+                    device = "cpu"
+                else:
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                self._semantic_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+                self._semantic_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
+                self._semantic_model.to(device)
+                self._semantic_model.eval()
+                self._semantic_device = device
+            except Exception:
+                self._semantic_model = None
+                self._semantic_processor = None
+                self._semantic_device = "cpu"
+            self._semantic_model_ready = True
+        return self._semantic_model is not None and self._semantic_processor is not None
+
+    def _semantic_embedding_from_image(self, img: "Image.Image") -> list[float]:
+        if self._semantic_backend != "clip":
+            return self._embedding_from_image(img)
+        if not self._ensure_semantic_model():
+            return self._embedding_from_image(img)
+        if torch is None:
+            return self._embedding_from_image(img)
+        try:
+            assert self._semantic_model is not None
+            assert self._semantic_processor is not None
+            inputs = self._semantic_processor(images=img.convert("RGB"), return_tensors="pt")
+            inputs = {k: v.to(self._semantic_device) for k, v in inputs.items()}
+            with torch.no_grad():
+                image_features = self._semantic_model.get_image_features(**inputs)
+                image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
+            return image_features[0].detach().cpu().tolist()
+        except Exception:
+            return self._embedding_from_image(img)
+
+    def _item_semantic_embedding(self, item: CatalogItemRecord) -> list[float]:
+        if self._semantic_backend != "clip":
+            return []
+        cached = self._item_semantic_embedding_cache.get(item.product_id)
+        if cached is not None:
+            return cached
+        cache_path = self._catalog_cache_dir / f"{self._product_id_from_url(item.image_url)}.img"
+        if not cache_path.exists() or Image is None:
+            return []
+        try:
+            with Image.open(cache_path) as img:
+                vec = self._semantic_embedding_from_image(img)
+        except Exception:
+            vec = []
+        if vec:
+            self._item_semantic_embedding_cache[item.product_id] = vec
+        return vec
 
     def _embedding_from_url(self, image_url: str, client: Optional["httpx.Client"] = None) -> list[float]:
         if Image is None or httpx is None:

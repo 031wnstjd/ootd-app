@@ -7,22 +7,34 @@ services:
       - qdrant_data:/qdrant/storage
 
   backend:
-    image: python:3.12-slim
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        TORCH_FLAVOR: ${TORCH_FLAVOR:-cpu}
+        TORCH_VERSION: ${TORCH_VERSION:-2.5.1}
+    image: ootd-backend:local
     working_dir: /app/backend
     volumes:
       - ./:/app
+      - hf_cache:/root/.cache/huggingface
     environment:
       - JOB_STATE_FILE=/app/data/job_state.json
       - ASSET_ROOT=/app/data/assets
       - PUBLIC_BASE_URL=http://localhost:8000
-      - ENABLE_REAL_RENDER=1
+      - ENABLE_REAL_RENDER=0
       - YOUTUBE_UPLOAD_REQUIRED=0
       - YOUTUBE_PRIVACY_STATUS=unlisted
       - QDRANT_ENABLED=1
       - QDRANT_URL=http://qdrant:6333
       - QDRANT_COLLECTION=musinsa_catalog
+      - SEMANTIC_EMBEDDING_BACKEND=${SEMANTIC_EMBEDDING_BACKEND:-hist}
+      - CLIP_MODEL_NAME=${CLIP_MODEL_NAME:-openai/clip-vit-base-patch16}
+      - CLIP_DEVICE=${CLIP_DEVICE:-auto}
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
     command: >
-      bash -lc "pip install -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+      uvicorn app.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
     depends_on:
@@ -44,3 +56,4 @@ services:
 
 volumes:
   qdrant_data:
+  hf_cache:
