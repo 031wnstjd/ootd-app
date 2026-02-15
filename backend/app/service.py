@@ -543,6 +543,8 @@ class JobService:
                 rec.progress = 100
                 rec.completed_at = datetime.now(timezone.utc)
                 rec.failure_code = FailureCode.EMPTY_RESULT
+                if rec.items and all(item.failure_code is None for item in rec.items):
+                    rec.items[-1].failure_code = FailureCode.CRAWL_TIMEOUT
                 rec.youtube_upload_status = YouTubeUploadStatus.SKIPPED
                 self._persist_locked()
                 return
@@ -968,10 +970,17 @@ class JobService:
 
     def _fallback_catalog_items(self) -> list[CatalogItemRecord]:
         categories = ["outer", "top", "bottom", "shoes"]
+        category_ko = {
+            "outer": "아우터",
+            "top": "상의",
+            "bottom": "하의",
+            "shoes": "신발",
+        }
         items: list[CatalogItemRecord] = []
         for category in categories:
             for idx in range(1, 4):
-                query = f"무신사 {category} 코디 {idx}"
+                ko = category_ko.get(category, category)
+                query = f"{ko} 코디"
                 url = self._musinsa_search_url(query)
                 seed_vec = self._embedding_from_text(query)
                 items.append(
@@ -979,7 +988,7 @@ class JobService:
                         product_id=f"fallback-{category}-{idx}",
                         category=category,
                         brand="MUSINSA",
-                        product_name=f"{category.title()} 추천 아이템 {idx}",
+                        product_name=f"{ko} 추천 아이템 {idx}",
                         product_url=url,
                         image_url=url,
                         price=28000 + idx * 6000,
@@ -990,7 +999,7 @@ class JobService:
 
     @staticmethod
     def _musinsa_search_url(query: str) -> str:
-        return f"https://www.musinsa.com/search/musinsa/integration?q={quote_plus(query)}"
+        return f"https://www.musinsa.com/search/goods?keyword={quote_plus(query)}"
 
     def _save_upload(self, job_id: UUID, image_bytes: bytes, image_content_type: str | None) -> Path:
         ext = self._ext_from_content_type(image_content_type)
