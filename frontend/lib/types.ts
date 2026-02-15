@@ -55,6 +55,8 @@ export interface JobDetailResponse {
   preview_url?: string;
   video_url?: string;
   failure_code?: FailureCode;
+  parent_job_id?: string;
+  attempts?: number;
 }
 
 export interface RerankRequest {
@@ -76,6 +78,12 @@ export interface ApproveResponse {
   video_url?: string;
 }
 
+export interface RetryResponse {
+  previous_job_id: string;
+  new_job_id: string;
+  status: JobStatus;
+}
+
 export interface HistoryItem {
   job_id?: string;
   status?: JobStatus;
@@ -86,6 +94,14 @@ export interface HistoryItem {
 
 export interface HistoryResponse {
   jobs?: HistoryItem[];
+}
+
+export interface MetricsResponse {
+  total_jobs_created: number;
+  total_jobs_completed: number;
+  total_jobs_failed: number;
+  total_jobs_retried: number;
+  avg_processing_seconds: number;
 }
 
 export interface CreateJobInput {

@@ -70,6 +70,8 @@ class JobDetailResponse(BaseModel):
     preview_url: Optional[str] = None
     video_url: Optional[str] = None
     failure_code: Optional[FailureCode] = None
+    parent_job_id: Optional[UUID] = None
+    attempts: int = 1
 
 
 class RerankRequest(BaseModel):
@@ -89,6 +91,26 @@ class ApproveResponse(BaseModel):
     job_id: UUID
     status: JobStatus
     video_url: Optional[str] = None
+
+
+class RetryResponse(BaseModel):
+    previous_job_id: UUID
+    new_job_id: UUID
+    status: JobStatus
+
+
+class HealthResponse(BaseModel):
+    status: str
+    uptime_seconds: int
+    total_jobs: int
+
+
+class MetricsResponse(BaseModel):
+    total_jobs_created: int
+    total_jobs_completed: int
+    total_jobs_failed: int
+    total_jobs_retried: int
+    avg_processing_seconds: float
 
 
 class HistoryItem(BaseModel):

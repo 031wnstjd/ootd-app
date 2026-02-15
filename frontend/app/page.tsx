@@ -4,9 +4,11 @@ import { FormEvent, useEffect, useMemo, useState } from 'react';
 import {
   approveJob,
   createJob,
+  getMetrics,
   getJob,
   listHistory,
   rerankJob,
+  retryJob,
   toApiErrorMessage
 } from '@/lib/api';
 import {
@@ -15,6 +17,7 @@ import {
   JobDetailResponse,
   JobStatus,
   MatchItem,
+  MetricsResponse,
   QualityMode,
   ScoreBreakdown
 } from '@/lib/types';
@@ -124,11 +127,13 @@ export default function DashboardPage() {
   const [activeJobId, setActiveJobId] = useState<string>('');
   const [job, setJob] = useState<JobDetailResponse | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isRefreshingJob, setIsRefreshingJob] = useState(false);
   const [isRefreshingHistory, setIsRefreshingHistory] = useState(false);
   const [isApproving, setIsApproving] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
   const [rerankBusyCategory, setRerankBusyCategory] = useState<string>('');
   const [rerankPriceCapByCategory, setRerankPriceCapByCategory] = useState<Record<string, string>>({});
   const [rerankColorHintByCategory, setRerankColorHintByCategory] = useState<Record<string, string>>({});
@@ -137,6 +142,7 @@ export default function DashboardPage() {
   const [formError, setFormError] = useState('');
   const [jobError, setJobError] = useState('');
   const [historyError, setHistoryError] = useState('');
+  const [metricsError, setMetricsError] = useState('');
 
   const canApprove = job?.status === 'REVIEW_REQUIRED' && job.quality_mode === 'human_review';
   const isPolling = !!job?.status && ACTIVE_STATUSES.includes(job.status);
@@ -174,8 +180,19 @@ export default function DashboardPage() {
     }
   }
 
+  async function refreshMetrics() {
+    setMetricsError('');
+    try {
+      const res = await getMetrics();
+      setMetrics(res);
+    } catch (err) {
+      setMetricsError(toApiErrorMessage(err));
+    }
+  }
+
   useEffect(() => {
     void refreshHistory();
+    void refreshMetrics();
   }, []);
 
   useEffect(() => {
@@ -220,6 +237,7 @@ export default function DashboardPage() {
       setActiveJobId(created.job_id);
       await refreshJob(created.job_id);
       await refreshHistory();
+      await refreshMetrics();
     } catch (err) {
       setFormError(toApiErrorMessage(err));
     } finally {
@@ -309,6 +327,7 @@ export default function DashboardPage() {
       await approveJob(job.job_id);
       await refreshJob(job.job_id);
       await refreshHistory();
+      await refreshMetrics();
     } catch (err) {
       setJobError(toApiErrorMessage(err));
     } finally {
@@ -320,6 +339,23 @@ export default function DashboardPage() {
     if (!item.job_id) return;
     setActiveJobId(item.job_id);
     await refreshJob(item.job_id);
+  }
+
+  async function onRetryFailedJob() {
+    if (!job?.job_id || job.status !== 'FAILED') return;
+    setJobError('');
+    setIsRetrying(true);
+    try {
+      const res = await retryJob(job.job_id);
+      setActiveJobId(res.new_job_id);
+      await refreshJob(res.new_job_id);
+      await refreshHistory();
+      await refreshMetrics();
+    } catch (err) {
+      setJobError(toApiErrorMessage(err));
+    } finally {
+      setIsRetrying(false);
+    }
   }
 
   return (
@@ -429,6 +465,8 @@ export default function DashboardPage() {
                 <p>progress: {job.progress ?? '-'}%</p>
                 <p>quality_mode: {job.quality_mode}</p>
                 <p>look_count: {job.look_count}</p>
+                <p>attempts: {job.attempts ?? 1}</p>
+                <p>parent_job_id: {job.parent_job_id ?? '-'}</p>
               </div>
 
               <div>
@@ -511,11 +549,45 @@ export default function DashboardPage() {
                   {isApproving ? 'Approving...' : 'Approve (human_review)'}
                 </button>
               )}
+              {job.status === 'FAILED' && (
+                <button
+                  type="button"
+                  onClick={() => void onRetryFailedJob()}
+                  disabled={isRetrying}
+                  className="rounded-md bg-ink px-4 py-2 text-sm font-medium text-white disabled:bg-slate-400"
+                >
+                  {isRetrying ? 'Retrying...' : 'Retry Failed Job'}
+                </button>
+              )}
             </div>
           )}
 
           {jobError && <p className="mt-3 text-sm text-bad">{jobError}</p>}
         </div>
+      </section>
+
+      <section className="mt-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-lg font-semibold">Ops Metrics</h2>
+          <button
+            type="button"
+            onClick={() => void refreshMetrics()}
+            className="rounded-md border border-slate-300 px-3 py-1.5 text-sm"
+          >
+            Refresh
+          </button>
+        </div>
+        {!metrics && <p className="text-sm text-muted">No metrics yet.</p>}
+        {metrics && (
+          <div className="grid grid-cols-2 gap-2 text-sm lg:grid-cols-5">
+            <p className="rounded bg-panel px-2 py-1">created: {metrics.total_jobs_created}</p>
+            <p className="rounded bg-panel px-2 py-1">completed: {metrics.total_jobs_completed}</p>
+            <p className="rounded bg-panel px-2 py-1">failed: {metrics.total_jobs_failed}</p>
+            <p className="rounded bg-panel px-2 py-1">retried: {metrics.total_jobs_retried}</p>
+            <p className="rounded bg-panel px-2 py-1">avg sec: {metrics.avg_processing_seconds.toFixed(3)}</p>
+          </div>
+        )}
+        {metricsError && <p className="mt-3 text-sm text-bad">{metricsError}</p>}
       </section>
 
       <section className="mt-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">

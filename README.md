@@ -7,6 +7,7 @@
 - Backend: FastAPI (`backend/`)
 - Frontend: Next.js + Tailwind (`frontend/`)
 - API Contract: `openapi.yaml`
+- Persistence: JSON state file (`JOB_STATE_FILE`, default `./data/job_state.json`)
 
 ## Run (Local)
 
@@ -15,7 +16,7 @@
 ```bash
 cd backend
 python3 -m pip install -r requirements.txt --break-system-packages
-python3 -m uvicorn app.main:app --reload --port 8000
+JOB_STATE_FILE=../data/job_state.json python3 -m uvicorn app.main:app --reload --port 8000
 ```
 
 ### 2) Frontend
@@ -116,4 +117,7 @@ docker run --rm -v "$PWD":/work alpine sh -lc "chown -R $(id -u):$(id -g) /work/
 - `GET /v1/jobs/{job_id}`
 - `POST /v1/jobs/{job_id}/rerank`
 - `POST /v1/jobs/{job_id}/approve`
+- `POST /v1/jobs/{job_id}/retry`
 - `GET /v1/history`
+- `GET /healthz`
+- `GET /v1/metrics`

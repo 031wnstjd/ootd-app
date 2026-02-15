@@ -8,6 +8,8 @@ __pycache__/
 *.py[cod]
 .venv/
 .pytest_cache/
+backend/data/
+data/
 
 # Env
 .env
@@ -18,3 +20,6 @@ __pycache__/
 
 # Logs
 *.log
+
+# Build artifacts
+frontend/tsconfig.tsbuildinfo

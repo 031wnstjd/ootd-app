@@ -2,17 +2,20 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from .models import (
     ApproveResponse,
     CreateJobResponse,
+    HealthResponse,
     HistoryResponse,
     JobDetailResponse,
+    MetricsResponse,
     QualityMode,
     RerankRequest,
     RerankResponse,
+    RetryResponse,
 )
 from .service import JobService
 
@@ -33,9 +36,20 @@ async def create_job(
     quality_mode: QualityMode = Form(...),
     theme: str | None = Form(default=None),
     tone: str | None = Form(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> CreateJobResponse:
-    _ = image.filename
-    return service.create_job(look_count=look_count, quality_mode=quality_mode, theme=theme, tone=tone)
+    if image.content_type is None or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=422, detail="image content type must be image/*")
+    content = await image.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="image too large (max 10MB)")
+    return service.create_job(
+        look_count=look_count,
+        quality_mode=quality_mode,
+        theme=theme,
+        tone=tone,
+        idempotency_key=idempotency_key,
+    )
 
 
 @app.get("/v1/jobs/{job_id}", response_model=JobDetailResponse)
@@ -53,6 +67,11 @@ async def approve_job(job_id: UUID) -> ApproveResponse:
     return service.approve(job_id)
 
 
+@app.post("/v1/jobs/{job_id}/retry", response_model=RetryResponse, status_code=202)
+async def retry_job(job_id: UUID) -> RetryResponse:
+    return service.retry(job_id)
+
+
 @app.get("/v1/history", response_model=HistoryResponse)
 async def list_history(limit: int = 20) -> HistoryResponse:
     if limit < 1:
@@ -60,3 +79,13 @@ async def list_history(limit: int = 20) -> HistoryResponse:
     if limit > 100:
         limit = 100
     return service.history(limit)
+
+
+@app.get("/healthz", response_model=HealthResponse)
+async def healthz() -> HealthResponse:
+    return service.health()
+
+
+@app.get("/v1/metrics", response_model=MetricsResponse)
+async def metrics() -> MetricsResponse:
+    return service.metrics()

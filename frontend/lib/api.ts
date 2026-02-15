@@ -4,8 +4,10 @@ import {
   CreateJobResponse,
   HistoryResponse,
   JobDetailResponse,
+  MetricsResponse,
   RerankRequest,
-  RerankResponse
+  RerankResponse,
+  RetryResponse
 } from '@/lib/types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000';
@@ -47,6 +49,9 @@ export async function createJob(input: CreateJobInput): Promise<CreateJobRespons
 
   return request<CreateJobResponse>('/v1/jobs', {
     method: 'POST',
+    headers: {
+      'Idempotency-Key': crypto.randomUUID()
+    },
     body: form
   });
 }
@@ -71,9 +76,19 @@ export async function approveJob(jobId: string): Promise<ApproveResponse> {
   });
 }
 
+export async function retryJob(jobId: string): Promise<RetryResponse> {
+  return request<RetryResponse>(`/v1/jobs/${jobId}/retry`, {
+    method: 'POST'
+  });
+}
+
 export async function listHistory(limit = 20): Promise<HistoryResponse> {
   const params = new URLSearchParams({ limit: String(limit) });
   return request<HistoryResponse>(`/v1/history?${params.toString()}`);
+}
+
+export async function getMetrics(): Promise<MetricsResponse> {
+  return request<MetricsResponse>('/v1/metrics');
 }
 
 export function toApiErrorMessage(err: unknown): string {

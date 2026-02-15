@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import io
+import tempfile
 import time
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -14,7 +16,8 @@ from app.service import JobService
 
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    monkeypatch.setattr(api_main, "service", JobService())
+    state_file = Path(tempfile.mkdtemp(prefix="jobservice-test-")) / "job_state.json"
+    monkeypatch.setattr(api_main, "service", JobService(state_file=state_file))
     return TestClient(api_main.app)
 
 
@@ -74,6 +77,7 @@ def _assert_job_detail_shape(payload: dict) -> None:
     assert payload["quality_mode"] in {"auto_gate", "human_review"}
     assert 1 <= payload["look_count"] <= 5
     assert payload["progress"] is None or 0 <= payload["progress"] <= 100
+    assert isinstance(payload.get("attempts"), int)
 
 
 def test_auto_gate_job_progresses_and_history(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -191,6 +195,20 @@ def test_create_job_validation_errors(client: TestClient) -> None:
         data={"look_count": "3"},
     )
     assert missing_quality_mode.status_code == 422
+
+    invalid_content_type = client.post(
+        "/v1/jobs",
+        files={"image": ("fit.txt", io.BytesIO(b"text"), "text/plain")},
+        data={"look_count": "3", "quality_mode": "auto_gate"},
+    )
+    assert invalid_content_type.status_code == 422
+
+    oversized = client.post(
+        "/v1/jobs",
+        files={"image": ("fit.jpg", io.BytesIO(b"x" * (10 * 1024 * 1024 + 1)), "image/jpeg")},
+        data={"look_count": "3", "quality_mode": "auto_gate"},
+    )
+    assert oversized.status_code == 413
 
 
 def test_create_job_response_schema(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -317,6 +335,64 @@ def test_history_limit_bounds(client: TestClient, monkeypatch: pytest.MonkeyPatc
     limit_too_high = client.get("/v1/history?limit=999")
     assert limit_too_high.status_code == 200
     assert len(limit_too_high.json()["jobs"]) == 3
+
+
+def test_create_job_idempotency_key_returns_same_job(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.service.random.random", lambda: 0.99)
+    headers = {"Idempotency-Key": "same-request-key"}
+    first = client.post(
+        "/v1/jobs",
+        files={"image": ("fit.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        data={"look_count": "2", "quality_mode": "auto_gate"},
+        headers=headers,
+    )
+    second = client.post(
+        "/v1/jobs",
+        files={"image": ("fit.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        data={"look_count": "2", "quality_mode": "auto_gate"},
+        headers=headers,
+    )
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert first.json()["job_id"] == second.json()["job_id"]
+
+
+def test_retry_failed_job_flow(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.service.random.random", lambda: 0.0)
+    failed_job_id = _create_job(client, quality_mode="auto_gate", look_count=4)
+    terminal = _wait_for_terminal(client, failed_job_id)
+    assert terminal["status"] == JobStatus.FAILED.value
+
+    retry = client.post(f"/v1/jobs/{failed_job_id}/retry")
+    assert retry.status_code == 202
+    body = retry.json()
+    assert body["previous_job_id"] == failed_job_id
+    assert body["new_job_id"] != failed_job_id
+
+    retried_detail = client.get(f"/v1/jobs/{body['new_job_id']}")
+    assert retried_detail.status_code == 200
+    retried_payload = retried_detail.json()
+    assert retried_payload["attempts"] == 2
+    assert retried_payload["parent_job_id"] == failed_job_id
+
+
+def test_health_and_metrics_endpoints(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.service.random.random", lambda: 0.99)
+    job_id = _create_job(client, quality_mode="auto_gate", look_count=2)
+    _wait_for_terminal(client, job_id)
+
+    health = client.get("/healthz")
+    assert health.status_code == 200
+    health_body = health.json()
+    assert health_body["status"] == "ok"
+    assert health_body["total_jobs"] >= 1
+
+    metrics = client.get("/v1/metrics")
+    assert metrics.status_code == 200
+    metrics_body = metrics.json()
+    assert metrics_body["total_jobs_created"] >= 1
+    assert metrics_body["total_jobs_completed"] >= 1
+    assert metrics_body["avg_processing_seconds"] >= 0
 
 
 def test_history_default_limit_and_valid_limit(client: TestClient) -> None:
