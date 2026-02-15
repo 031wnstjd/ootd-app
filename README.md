@@ -139,6 +139,14 @@ docker run --rm -v "$PWD":/work alpine sh -lc "chown -R $(id -u):$(id -g) /work/
 
 크롤링 캐시(`data/assets/catalog-cache/*.img`)를 사람이 확인 가능한 JPG 데이터셋으로 내보냅니다.
 
+- 크롤링 파이프라인 완료 시 자동으로 아래 두 경로에 동기화됩니다.
+  - `datasets/catalog-jpg/`
+  - `data/datasets/catalog-jpg/`
+- 제어 환경변수:
+  - `CATALOG_DATASET_EXPORT_ENABLED` (default `1`)
+  - `CATALOG_DATASET_EXPORT_DIRS` (comma-separated, default `datasets/catalog-jpg,data/datasets/catalog-jpg`)
+  - `CATALOG_DATASET_INCLUDE_FALLBACK` (default `0`)
+
 ```bash
 cd /home/junsung/vibe_coding/lookbook-app/ootd-app
 python3 scripts/export_catalog_jpg_dataset.py

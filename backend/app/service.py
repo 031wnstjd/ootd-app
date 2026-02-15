@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import math
 import os
@@ -77,6 +78,7 @@ except Exception:  # pragma: no cover
 
 
 STEP_SECONDS = 0.05
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STATE_FILE = Path(os.getenv("JOB_STATE_FILE", "./data/job_state.json"))
 DEFAULT_ASSET_ROOT = Path(os.getenv("ASSET_ROOT", "./data/assets"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
@@ -88,6 +90,12 @@ CATALOG_MIN_IMAGE_SIM = float(os.getenv("CATALOG_MIN_IMAGE_SIM", "0.35"))
 CATALOG_MIN_ITEMS_PER_CATEGORY = int(os.getenv("CATALOG_MIN_ITEMS_PER_CATEGORY", "300"))
 CATALOG_CRAWL_USE_IMAGE_EMBEDDING = os.getenv("CATALOG_CRAWL_USE_IMAGE_EMBEDDING", "1") == "1"
 CATALOG_ALLOW_SYNTHETIC_PADDING = os.getenv("CATALOG_ALLOW_SYNTHETIC_PADDING", "0") == "1"
+CATALOG_DATASET_EXPORT_ENABLED = os.getenv("CATALOG_DATASET_EXPORT_ENABLED", "1") == "1"
+CATALOG_DATASET_INCLUDE_FALLBACK = os.getenv("CATALOG_DATASET_INCLUDE_FALLBACK", "0") == "1"
+CATALOG_DATASET_EXPORT_DIRS = os.getenv(
+    "CATALOG_DATASET_EXPORT_DIRS",
+    "datasets/catalog-jpg,data/datasets/catalog-jpg",
+)
 
 
 @dataclass
@@ -158,6 +166,7 @@ class JobService:
         self._previews_dir = self._asset_root / "previews"
         self._videos_dir = self._asset_root / "videos"
         self._catalog_cache_dir = self._asset_root / "catalog-cache"
+        self._dataset_export_dirs = self._parse_dataset_export_dirs(CATALOG_DATASET_EXPORT_DIRS)
         self._enable_real_render = enable_real_render
         self._uploads_dir.mkdir(parents=True, exist_ok=True)
         self._previews_dir.mkdir(parents=True, exist_ok=True)
@@ -931,7 +940,9 @@ class JobService:
             with self._lock:
                 for item in fallback:
                     self._catalog[item.product_id] = item
+                snapshot = list(self._catalog.values())
                 self._persist_locked()
+            self._export_catalog_datasets(snapshot)
             return len(fallback), len(fallback)
 
         with httpx.Client(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
@@ -962,8 +973,100 @@ class JobService:
 
         with self._lock:
             self._catalog.update(products)
+            snapshot = list(self._catalog.values())
             self._persist_locked()
+        self._export_catalog_datasets(snapshot)
         return len(products), indexed
+
+    @staticmethod
+    def _parse_dataset_export_dirs(raw_dirs: str) -> list[Path]:
+        dirs: list[Path] = []
+        for token in raw_dirs.split(","):
+            value = token.strip()
+            if not value:
+                continue
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                candidate = (PROJECT_ROOT / candidate).resolve()
+            dirs.append(candidate)
+        return dirs
+
+    def _export_catalog_datasets(self, catalog_items: list[CatalogItemRecord]) -> None:
+        if not CATALOG_DATASET_EXPORT_ENABLED or Image is None:
+            return
+        for output_dir in self._dataset_export_dirs:
+            try:
+                self._export_catalog_dataset(output_dir, catalog_items)
+            except Exception:
+                continue
+
+    def _export_catalog_dataset(self, output_dir: Path, catalog_items: list[CatalogItemRecord]) -> None:
+        if output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = output_dir / "manifest.csv"
+
+        with manifest_path.open("w", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(
+                fp,
+                fieldnames=[
+                    "product_id",
+                    "category",
+                    "brand",
+                    "product_name",
+                    "price",
+                    "product_url",
+                    "image_url",
+                    "cache_file",
+                    "export_file",
+                ],
+            )
+            writer.writeheader()
+
+            used_paths: set[str] = set()
+            rows = sorted(catalog_items, key=lambda item: (item.category, item.product_id))
+            for item in rows:
+                if not CATALOG_DATASET_INCLUDE_FALLBACK and item.product_id.startswith("fallback-"):
+                    continue
+                cache_key = self._product_id_from_url(item.image_url)
+                cache_file = self._catalog_cache_dir / f"{cache_key}.img"
+                if not cache_file.exists():
+                    continue
+
+                category_dir = output_dir / self._safe_file_token(item.category or "unknown")
+                category_dir.mkdir(parents=True, exist_ok=True)
+
+                stem = self._safe_file_token(item.product_id)
+                export_file = category_dir / f"{stem}.jpg"
+                suffix = 2
+                while str(export_file) in used_paths:
+                    export_file = category_dir / f"{stem}_{suffix}.jpg"
+                    suffix += 1
+
+                with Image.open(cache_file) as img:
+                    img.convert("RGB").save(export_file, format="JPEG", quality=92)
+
+                used_paths.add(str(export_file))
+                writer.writerow(
+                    {
+                        "product_id": item.product_id,
+                        "category": item.category,
+                        "brand": item.brand,
+                        "product_name": item.product_name,
+                        "price": item.price,
+                        "product_url": item.product_url,
+                        "image_url": item.image_url,
+                        "cache_file": str(cache_file),
+                        "export_file": str(export_file),
+                    }
+                )
+
+    @staticmethod
+    def _safe_file_token(value: str) -> str:
+        token = re.sub(r"[^a-zA-Z0-9._-]+", "_", value.strip())
+        if not token:
+            return "item"
+        return token[:120]
 
     @staticmethod
     def _catalog_seed_queries() -> dict[str, str]:
