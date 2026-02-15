@@ -52,8 +52,9 @@ const RERANK_PRESET_STORAGE_KEY = 'ootd_rerank_presets_v1';
 const CATEGORY_LABEL: Record<string, string> = {
   outer: '아우터',
   top: '상의',
-  bottom: '하의',
-  shoes: '신발'
+  bottom: '바지',
+  shoes: '신발',
+  bag: '가방'
 };
 
 type RerankPreset = {

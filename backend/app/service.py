@@ -84,6 +84,7 @@ ENABLE_REAL_RENDER = os.getenv("ENABLE_REAL_RENDER", "1") == "1"
 YOUTUBE_UPLOAD_REQUIRED = os.getenv("YOUTUBE_UPLOAD_REQUIRED", "0") == "1"
 YOUTUBE_PRIVACY_STATUS = os.getenv("YOUTUBE_PRIVACY_STATUS", "unlisted")
 CATALOG_MIN_IMAGE_SIM = float(os.getenv("CATALOG_MIN_IMAGE_SIM", "0.35"))
+CATALOG_MIN_ITEMS_PER_CATEGORY = int(os.getenv("CATALOG_MIN_ITEMS_PER_CATEGORY", "3"))
 
 
 @dataclass
@@ -860,12 +861,8 @@ class JobService:
 
     def _crawl_and_index(self, limit_per_category: int) -> tuple[int, int]:
         products: dict[str, CatalogItemRecord] = {}
-        seeds = {
-            "outer": "무신사 아우터",
-            "top": "무신사 상의",
-            "bottom": "무신사 하의",
-            "shoes": "무신사 신발",
-        }
+        seeds = self._catalog_seed_queries()
+        min_per_category = max(1, min(limit_per_category, CATALOG_MIN_ITEMS_PER_CATEGORY))
         if httpx is None or BeautifulSoup is None:
             fallback = self._fallback_catalog_items()
             with self._lock:
@@ -876,7 +873,12 @@ class JobService:
 
         with httpx.Client(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
             for category, query in seeds.items():
-                discovered = self._crawl_search_page(client, category, query, limit_per_category)
+                discovered = self._crawl_goods_api(client, category, query, limit_per_category)
+                if not discovered:
+                    discovered = self._crawl_search_page(client, category, query, limit_per_category)
+                if len(discovered) < min_per_category:
+                    fallback = self._fallback_items_for_category(category, min_per_category - len(discovered))
+                    discovered.extend(fallback)
                 for item in discovered:
                     products[item.product_id] = item
 
@@ -895,6 +897,109 @@ class JobService:
             self._catalog.update(products)
             self._persist_locked()
         return len(products), indexed
+
+    @staticmethod
+    def _catalog_seed_queries() -> dict[str, str]:
+        # Keep `bottom` for match pipeline compatibility while using "바지" keyword for crawl quality.
+        return {
+            "shoes": "신발",
+            "top": "상의",
+            "outer": "아우터",
+            "bottom": "바지",
+            "bag": "가방",
+        }
+
+    def _fallback_items_for_category(self, category: str, needed: int) -> list[CatalogItemRecord]:
+        if needed <= 0:
+            return []
+        fallback = [item for item in self._fallback_catalog_items() if item.category == category]
+        return fallback[:needed]
+
+    def _crawl_goods_api(
+        self,
+        client: "httpx.Client",
+        category: str,
+        keyword: str,
+        limit_count: int,
+    ) -> list[CatalogItemRecord]:
+        records: list[CatalogItemRecord] = []
+        seen_ids: set[str] = set()
+        page = 1
+        page_size = min(60, max(10, limit_count))
+        base_url = "https://api.musinsa.com/api2/dp/v1/plp/goods"
+
+        while len(records) < limit_count and page <= 5:
+            params = {
+                "keyword": keyword,
+                "caller": "SEARCH",
+                "gf": "A",
+                "page": page,
+                "size": page_size,
+                "sortCode": "POPULAR",
+            }
+            try:
+                resp = client.get(
+                    base_url,
+                    params=params,
+                    headers={
+                        "Accept": "application/json",
+                        "Referer": f"https://www.musinsa.com/search/results/goods?keyword={quote_plus(keyword)}",
+                    },
+                )
+            except Exception:
+                break
+            if resp.status_code != 200:
+                break
+            try:
+                payload = resp.json()
+            except Exception:
+                break
+            if (payload.get("meta") or {}).get("result") != "SUCCESS":
+                break
+            data = payload.get("data") or {}
+            rows = data.get("list") or []
+            if not rows:
+                break
+            for row in rows:
+                product_id = str(row.get("goodsNo") or "").strip()
+                if not product_id or product_id in seen_ids:
+                    continue
+                product_url = str(row.get("goodsLinkUrl") or "").strip()
+                image_url = str(row.get("thumbnail") or "").strip()
+                product_name = str(row.get("goodsName") or "").strip()
+                if not product_url or not image_url or not product_name:
+                    continue
+                if image_url.startswith("//"):
+                    image_url = f"https:{image_url}"
+                if product_url.startswith("/"):
+                    product_url = urljoin("https://www.musinsa.com", product_url)
+                price_raw = row.get("price")
+                price: Optional[int]
+                if isinstance(price_raw, (int, float)):
+                    price = int(price_raw)
+                else:
+                    price = self._extract_price(str(price_raw or ""))
+                records.append(
+                    CatalogItemRecord(
+                        product_id=product_id,
+                        category=category,
+                        brand=str(row.get("brandName") or row.get("brand") or "MUSINSA"),
+                        product_name=product_name,
+                        product_url=self._normalize_url(product_url),
+                        image_url=image_url,
+                        price=price,
+                        embedding=[],
+                    )
+                )
+                seen_ids.add(product_id)
+                if len(records) >= limit_count:
+                    break
+            pagination = data.get("pagination") or {}
+            has_next = bool(pagination.get("hasNext"))
+            if not has_next:
+                break
+            page += 1
+        return records
 
     def _crawl_search_page(
         self,
@@ -1055,12 +1160,13 @@ class JobService:
         return [v / norm for v in vec]
 
     def _fallback_catalog_items(self) -> list[CatalogItemRecord]:
-        categories = ["outer", "top", "bottom", "shoes"]
+        categories = ["outer", "top", "bottom", "shoes", "bag"]
         category_ko = {
             "outer": "아우터",
             "top": "상의",
-            "bottom": "하의",
+            "bottom": "바지",
             "shoes": "신발",
+            "bag": "가방",
         }
         items: list[CatalogItemRecord] = []
         for category in categories:
