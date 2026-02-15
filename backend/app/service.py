@@ -109,6 +109,8 @@ QDRANT_ENABLED = os.getenv("QDRANT_ENABLED", "1") == "1"
 QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "musinsa_catalog")
 QDRANT_TOPK_MULTIPLIER = int(os.getenv("QDRANT_TOPK_MULTIPLIER", "12"))
+QDRANT_TIMEOUT_SECONDS = float(os.getenv("QDRANT_TIMEOUT_SECONDS", "10"))
+QDRANT_UPSERT_BATCH_SIZE = int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", "200"))
 
 
 @dataclass
@@ -1049,7 +1051,7 @@ class JobService:
         if not QDRANT_ENABLED or QdrantClient is None or qdrant_models is None:
             return None
         try:
-            client = QdrantClient(url=QDRANT_URL, timeout=2.0)
+            client = QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT_SECONDS)
             return client
         except Exception:
             return None
@@ -1076,15 +1078,41 @@ class JobService:
         if not valid:
             self._set_crawl_timestamp(mode)
             return
-        self._ensure_qdrant_collection(len(valid[0].embedding))
-        if mode == CrawlMode.full:
-            try:
-                self._qdrant_client.delete_collection(QDRANT_COLLECTION)
-            except Exception:
-                pass
+        try:
             self._ensure_qdrant_collection(len(valid[0].embedding))
-        points = []
-        for item in valid:
+            if mode == CrawlMode.full:
+                try:
+                    self._qdrant_client.delete_collection(QDRANT_COLLECTION)
+                except Exception:
+                    pass
+                self._ensure_qdrant_collection(len(valid[0].embedding))
+            points = []
+            for item in valid:
+                payload = {
+                    "product_id": item.product_id,
+                    "category": item.category,
+                    "brand": item.brand,
+                    "price": item.price if item.price is not None else -1,
+                    "product_url": item.product_url,
+                    "image_url": item.image_url,
+                    "updated_at": item.updated_at.isoformat(),
+                }
+                pid = abs(hash(item.product_id)) % (2**63 - 1)
+                points.append(qdrant_models.PointStruct(id=pid, vector=item.embedding, payload=payload))
+            if points:
+                for idx in range(0, len(points), max(1, QDRANT_UPSERT_BATCH_SIZE)):
+                    batch = points[idx : idx + max(1, QDRANT_UPSERT_BATCH_SIZE)]
+                    self._qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=batch, wait=False)
+        except Exception:
+            # Degrade gracefully: crawl/index should still complete even if vector sync is unstable.
+            pass
+        self._set_crawl_timestamp(mode)
+
+    def _upsert_qdrant_item(self, item: CatalogItemRecord) -> None:
+        if self._qdrant_client is None or qdrant_models is None or not item.embedding:
+            return
+        try:
+            self._ensure_qdrant_collection(len(item.embedding))
             payload = {
                 "product_id": item.product_id,
                 "category": item.category,
@@ -1095,30 +1123,13 @@ class JobService:
                 "updated_at": item.updated_at.isoformat(),
             }
             pid = abs(hash(item.product_id)) % (2**63 - 1)
-            points.append(qdrant_models.PointStruct(id=pid, vector=item.embedding, payload=payload))
-        if points:
-            self._qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=points, wait=False)
-        self._set_crawl_timestamp(mode)
-
-    def _upsert_qdrant_item(self, item: CatalogItemRecord) -> None:
-        if self._qdrant_client is None or qdrant_models is None or not item.embedding:
-            return
-        self._ensure_qdrant_collection(len(item.embedding))
-        payload = {
-            "product_id": item.product_id,
-            "category": item.category,
-            "brand": item.brand,
-            "price": item.price if item.price is not None else -1,
-            "product_url": item.product_url,
-            "image_url": item.image_url,
-            "updated_at": item.updated_at.isoformat(),
-        }
-        pid = abs(hash(item.product_id)) % (2**63 - 1)
-        self._qdrant_client.upsert(
-            collection_name=QDRANT_COLLECTION,
-            points=[qdrant_models.PointStruct(id=pid, vector=item.embedding, payload=payload)],
-            wait=False,
-        )
+            self._qdrant_client.upsert(
+                collection_name=QDRANT_COLLECTION,
+                points=[qdrant_models.PointStruct(id=pid, vector=item.embedding, payload=payload)],
+                wait=False,
+            )
+        except Exception:
+            pass
 
     def _qdrant_search_candidates(
         self,
