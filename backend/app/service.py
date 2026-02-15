@@ -70,9 +70,10 @@ except Exception:  # pragma: no cover
     BeautifulSoup = None  # type: ignore[assignment]
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageFilter
 except Exception:  # pragma: no cover
     Image = None  # type: ignore[assignment]
+    ImageFilter = None  # type: ignore[assignment]
 
 
 STEP_SECONDS = 0.05
@@ -86,6 +87,7 @@ YOUTUBE_PRIVACY_STATUS = os.getenv("YOUTUBE_PRIVACY_STATUS", "unlisted")
 CATALOG_MIN_IMAGE_SIM = float(os.getenv("CATALOG_MIN_IMAGE_SIM", "0.35"))
 CATALOG_MIN_ITEMS_PER_CATEGORY = int(os.getenv("CATALOG_MIN_ITEMS_PER_CATEGORY", "300"))
 CATALOG_CRAWL_USE_IMAGE_EMBEDDING = os.getenv("CATALOG_CRAWL_USE_IMAGE_EMBEDDING", "1") == "1"
+CATALOG_ALLOW_SYNTHETIC_PADDING = os.getenv("CATALOG_ALLOW_SYNTHETIC_PADDING", "0") == "1"
 
 
 @dataclass
@@ -327,15 +329,18 @@ class JobService:
             items = list(self._catalog.values())
 
         indexed = 0
-        for item in items:
-            embedding = self._embedding_from_url(item.image_url)
-            if embedding:
-                with self._lock:
-                    existing = self._catalog.get(item.product_id)
-                    if existing:
-                        existing.embedding = embedding
-                        existing.updated_at = datetime.now(timezone.utc)
-                indexed += 1
+        if httpx is None:
+            return CatalogIndexRebuildResponse(total_products=len(items), total_indexed_products=0)
+        with httpx.Client(timeout=4.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            for item in items:
+                embedding = self._embedding_from_url(item.image_url, client=client)
+                if embedding:
+                    with self._lock:
+                        existing = self._catalog.get(item.product_id)
+                        if existing:
+                            existing.embedding = embedding
+                            existing.updated_at = datetime.now(timezone.utc)
+                    indexed += 1
 
         with self._lock:
             self._persist_locked()
@@ -667,9 +672,10 @@ class JobService:
         color_hint: Optional[str],
     ) -> list[MatchItem]:
         effective_look_count = self._effective_auto_match_count(look_count, category)
-        query_vector = self._embedding_from_file(upload_image_path) if upload_image_path else []
-        if not query_vector:
-            query_vector = self._embedding_from_text(color_hint or "street casual")
+        query_vectors = self._query_vectors_by_category(upload_image_path)
+        global_query_vector = query_vectors.get("global", [])
+        if not global_query_vector:
+            return []
 
         with self._lock:
             catalog_items = list(self._catalog.values())
@@ -686,13 +692,15 @@ class JobService:
                 continue
             if not item.embedding:
                 continue
-            image_sim = self._cosine_similarity(query_vector, item.embedding)
-            if image_sim < CATALOG_MIN_IMAGE_SIM:
+            item_query = query_vectors.get(item.category) or global_query_vector
+            image_sim = self._cosine_similarity(item_query, item.embedding)
+            min_image_sim = 0.0 if item.product_id.startswith("fallback-") else CATALOG_MIN_IMAGE_SIM
+            if image_sim < min_image_sim:
                 continue
-            text_score = self._text_hint_score(item.product_name, color_hint_text)
+            text_score = 0.0
             category_score = 1.0 if category and item.category == category else 0.8
             price_score = self._price_fit_score(item.price, price_cap)
-            final = 0.70 * image_sim + 0.15 * category_score + 0.10 * text_score + 0.05 * price_score
+            final = image_sim if price_cap is None else (0.92 * image_sim + 0.08 * price_score)
             score = ScoreBreakdown(
                 image=round(image_sim, 4),
                 text=round(text_score, 4),
@@ -700,7 +708,8 @@ class JobService:
                 price=round(price_score, 4),
                 final=round(final, 4),
             )
-            tags = ["vector:hist", f"category:{item.category}", "source:crawled"]
+            query_region = item.category if item.category in query_vectors else "global"
+            tags = ["vector:image-only", f"query_region:{query_region}", f"category:{item.category}", "source:crawled"]
             if price_cap is not None:
                 tags.append(f"price_cap:{price_cap}")
             if color_hint_text:
@@ -734,7 +743,7 @@ class JobService:
             existing_categories = {item.category for item in results if item.category}
             missing_required_categories = [req for req in required_categories if req not in existing_categories]
 
-        if (len(results) < effective_look_count or missing_required_categories) and not category:
+        if (len(results) < effective_look_count or missing_required_categories) and not category and CATALOG_ALLOW_SYNTHETIC_PADDING:
             # Fallback candidates to avoid empty UX when crawl data is temporarily sparse.
             needed = effective_look_count - len(results)
             existing_product_ids = {item.product_id for item in results if item.product_id}
@@ -800,6 +809,40 @@ class JobService:
                 optional = [row for row in results if row.category not in required_set]
                 results = (must_keep + optional)[:effective_look_count]
         return results
+
+    def _query_vectors_by_category(self, upload_image_path: Optional[str]) -> dict[str, list[float]]:
+        if not upload_image_path or Image is None:
+            return {}
+        path = Path(upload_image_path)
+        if not path.exists():
+            return {}
+        try:
+            with Image.open(path) as img:
+                rgb = img.convert("RGB")
+                width, height = rgb.size
+                if width < 16 or height < 16:
+                    global_vec = self._embedding_from_image(rgb)
+                    return {"global": global_vec}
+
+                def crop_box(x1: float, y1: float, x2: float, y2: float) -> tuple[int, int, int, int]:
+                    left = max(0, min(width - 1, int(width * x1)))
+                    top = max(0, min(height - 1, int(height * y1)))
+                    right = max(left + 1, min(width, int(width * x2)))
+                    bottom = max(top + 1, min(height, int(height * y2)))
+                    return (left, top, right, bottom)
+
+                vectors: dict[str, list[float]] = {"global": self._embedding_from_image(rgb)}
+                vectors["top"] = self._embedding_from_image(rgb.crop(crop_box(0.10, 0.05, 0.90, 0.45)))
+                vectors["bottom"] = self._embedding_from_image(rgb.crop(crop_box(0.12, 0.45, 0.88, 0.82)))
+                vectors["outer"] = self._embedding_from_image(rgb.crop(crop_box(0.06, 0.02, 0.94, 0.60)))
+                vectors["shoes"] = self._embedding_from_image(rgb.crop(crop_box(0.15, 0.82, 0.85, 0.99)))
+
+                bag_left = self._embedding_from_image(rgb.crop(crop_box(0.00, 0.25, 0.38, 0.80)))
+                bag_right = self._embedding_from_image(rgb.crop(crop_box(0.62, 0.25, 1.00, 0.80)))
+                vectors["bag"] = self._normalize_vector([(a + b) / 2.0 for a, b in zip(bag_left, bag_right)])
+                return vectors
+        except Exception:
+            return {}
 
     @staticmethod
     def _effective_auto_match_count(look_count: int, category: Optional[str]) -> int:
@@ -896,21 +939,22 @@ class JobService:
                 discovered = self._crawl_goods_api(client, category, query, target_per_category)
                 if not discovered:
                     discovered = self._crawl_search_page(client, category, query, target_per_category)
-                if len(discovered) < target_per_category:
+                if len(discovered) < target_per_category and CATALOG_ALLOW_SYNTHETIC_PADDING:
                     fallback = self._fallback_items_for_category(category, target_per_category - len(discovered))
                     discovered.extend(fallback)
                 for item in discovered:
                     products[item.product_id] = item
 
         indexed = 0
-        for item in products.values():
-            if not item.embedding:
-                if CATALOG_CRAWL_USE_IMAGE_EMBEDDING:
-                    item.embedding = self._embedding_from_url(item.image_url)
+        with httpx.Client(timeout=4.0, headers={"User-Agent": "Mozilla/5.0"}) as embed_client:
+            for item in products.values():
                 if not item.embedding:
-                    item.embedding = self._embedding_from_text(f"{item.category} {item.product_name}")
-            if item.embedding:
-                indexed += 1
+                    if CATALOG_CRAWL_USE_IMAGE_EMBEDDING:
+                        item.embedding = self._embedding_from_url(item.image_url, client=embed_client)
+                    if not item.embedding:
+                        item.embedding = self._embedding_from_text(f"{item.category} {item.product_name}")
+                if item.embedding:
+                    indexed += 1
 
         if not products:
             products = {item.product_id: item for item in self._fallback_catalog_items()}
@@ -936,33 +980,7 @@ class JobService:
         if needed <= 0:
             return []
         fallback = [item for item in self._fallback_catalog_items() if item.category == category]
-        if len(fallback) >= needed:
-            return fallback[:needed]
-        ko = {
-            "shoes": "신발",
-            "top": "상의",
-            "outer": "아우터",
-            "bottom": "바지",
-            "bag": "가방",
-        }.get(category, category)
-        items = list(fallback)
-        start_idx = len(items) + 1
-        for idx in range(start_idx, needed + 1):
-            query = f"{ko} 코디"
-            url = self._musinsa_search_url(query)
-            items.append(
-                CatalogItemRecord(
-                    product_id=f"fallback-{category}-{idx}",
-                    category=category,
-                    brand="MUSINSA",
-                    product_name=f"{ko} 추천 아이템 {idx}",
-                    product_url=url,
-                    image_url=url,
-                    price=28000 + (idx % 10) * 3000,
-                    embedding=self._embedding_from_text(f"{category} {ko} {idx}"),
-                )
-            )
-        return items[:needed]
+        return fallback[:needed]
 
     def _crawl_goods_api(
         self,
@@ -1172,25 +1190,29 @@ class JobService:
         except Exception:
             return []
 
-    def _embedding_from_url(self, image_url: str) -> list[float]:
+    def _embedding_from_url(self, image_url: str, client: Optional["httpx.Client"] = None) -> list[float]:
         if Image is None or httpx is None:
             return []
         cache_path = self._catalog_cache_dir / f"{self._product_id_from_url(image_url)}.img"
         try:
             if not cache_path.exists():
-                with httpx.Client(timeout=4.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+                if client is None:
+                    with httpx.Client(timeout=4.0, headers={"User-Agent": "Mozilla/5.0"}) as temp_client:
+                        resp = temp_client.get(image_url)
+                else:
                     resp = client.get(image_url)
-                    if resp.status_code != 200 or not resp.content:
-                        return []
-                    cache_path.write_bytes(resp.content)
+                if resp.status_code != 200 or not resp.content:
+                    return []
+                cache_path.write_bytes(resp.content)
             with Image.open(cache_path) as img:
                 return self._embedding_from_image(img)
         except Exception:
             return []
 
     def _embedding_from_image(self, img: "Image.Image") -> list[float]:
-        rgb = img.convert("RGB").resize((96, 96))
-        hist = rgb.histogram()  # 256*3
+        rgb = img.convert("RGB")
+        hist_img = rgb.resize((96, 96))
+        hist = hist_img.histogram()  # 256*3
         bins_per_channel = 16
         channel_chunk = 256 // bins_per_channel
         vec: list[float] = []
@@ -1200,6 +1222,25 @@ class JobService:
                 start = offset + i * channel_chunk
                 end = offset + (i + 1) * channel_chunk
                 vec.append(float(sum(hist[start:end])))
+
+        # Add coarse spatial features for better shape/region discrimination.
+        spatial = rgb.resize((8, 8))
+        px = list(spatial.getdata())
+        for r, g, b in px:
+            vec.extend([r / 255.0, g / 255.0, b / 255.0])
+
+        # Add edge distribution to reduce plain color overfitting.
+        if ImageFilter is not None:
+            edge = rgb.convert("L").filter(ImageFilter.FIND_EDGES)
+        else:
+            edge = rgb.convert("L")
+        edge_hist = edge.resize((96, 96)).histogram()
+        edge_bins = 16
+        edge_chunk = 256 // edge_bins
+        for i in range(edge_bins):
+            start = i * edge_chunk
+            end = (i + 1) * edge_chunk
+            vec.append(float(sum(edge_hist[start:end])))
         return self._normalize_vector(vec)
 
     @staticmethod

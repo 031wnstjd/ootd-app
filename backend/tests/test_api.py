@@ -13,6 +13,11 @@ from app import main as api_main
 from app.models import JobStatus
 from app.service import JobService
 
+VALID_PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+    b"\x00\x00\x00\x0cIDAT\x08\xd7c\xf8\xff\xff?\x00\x05\xfe\x02\xfeA\x89\x1d\xdd\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
 
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
@@ -24,7 +29,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 def _create_job(client: TestClient, quality_mode: str = "auto_gate", look_count: int = 3) -> str:
     resp = client.post(
         "/v1/jobs",
-        files={"image": ("fit.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        files={"image": ("fit.png", io.BytesIO(VALID_PNG_BYTES), "image/png")},
         data={"look_count": str(look_count), "quality_mode": quality_mode},
     )
     assert resp.status_code == 202
@@ -176,28 +181,28 @@ def test_create_job_validation_errors(client: TestClient) -> None:
 
     missing_look_count = client.post(
         "/v1/jobs",
-        files={"image": ("fit.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        files={"image": ("fit.png", io.BytesIO(VALID_PNG_BYTES), "image/png")},
         data={"quality_mode": "auto_gate"},
     )
     assert missing_look_count.status_code == 422
 
     out_of_range_look_count = client.post(
         "/v1/jobs",
-        files={"image": ("fit.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        files={"image": ("fit.png", io.BytesIO(VALID_PNG_BYTES), "image/png")},
         data={"look_count": "6", "quality_mode": "auto_gate"},
     )
     assert out_of_range_look_count.status_code == 422
 
     invalid_quality_mode = client.post(
         "/v1/jobs",
-        files={"image": ("fit.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        files={"image": ("fit.png", io.BytesIO(VALID_PNG_BYTES), "image/png")},
         data={"look_count": "3", "quality_mode": "manual"},
     )
     assert invalid_quality_mode.status_code == 422
 
     missing_quality_mode = client.post(
         "/v1/jobs",
-        files={"image": ("fit.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        files={"image": ("fit.png", io.BytesIO(VALID_PNG_BYTES), "image/png")},
         data={"look_count": "3"},
     )
     assert missing_quality_mode.status_code == 422
@@ -211,7 +216,7 @@ def test_create_job_validation_errors(client: TestClient) -> None:
 
     oversized = client.post(
         "/v1/jobs",
-        files={"image": ("fit.jpg", io.BytesIO(b"x" * (10 * 1024 * 1024 + 1)), "image/jpeg")},
+        files={"image": ("fit.png", io.BytesIO(b"x" * (10 * 1024 * 1024 + 1)), "image/png")},
         data={"look_count": "3", "quality_mode": "auto_gate"},
     )
     assert oversized.status_code == 413
@@ -221,7 +226,7 @@ def test_create_job_response_schema(client: TestClient, monkeypatch: pytest.Monk
     monkeypatch.setattr("app.service.random.random", lambda: 0.99)
     resp = client.post(
         "/v1/jobs",
-        files={"image": ("fit.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        files={"image": ("fit.png", io.BytesIO(VALID_PNG_BYTES), "image/png")},
         data={"look_count": "3", "quality_mode": "auto_gate"},
     )
     assert resp.status_code == 202
@@ -348,13 +353,13 @@ def test_create_job_idempotency_key_returns_same_job(client: TestClient, monkeyp
     headers = {"Idempotency-Key": "same-request-key"}
     first = client.post(
         "/v1/jobs",
-        files={"image": ("fit.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        files={"image": ("fit.png", io.BytesIO(VALID_PNG_BYTES), "image/png")},
         data={"look_count": "2", "quality_mode": "auto_gate"},
         headers=headers,
     )
     second = client.post(
         "/v1/jobs",
-        files={"image": ("fit.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        files={"image": ("fit.png", io.BytesIO(VALID_PNG_BYTES), "image/png")},
         data={"look_count": "2", "quality_mode": "auto_gate"},
         headers=headers,
     )
