@@ -76,6 +76,8 @@ export default function DashboardPage() {
   const [isRefreshingHistory, setIsRefreshingHistory] = useState(false);
   const [isApproving, setIsApproving] = useState(false);
   const [rerankBusyCategory, setRerankBusyCategory] = useState<string>('');
+  const [rerankPriceCapByCategory, setRerankPriceCapByCategory] = useState<Record<string, string>>({});
+  const [rerankColorHintByCategory, setRerankColorHintByCategory] = useState<Record<string, string>>({});
 
   const [formError, setFormError] = useState('');
   const [jobError, setJobError] = useState('');
@@ -162,10 +164,18 @@ export default function DashboardPage() {
   async function onRerank(item: MatchItem) {
     if (!job?.job_id || !item.category) return;
 
+    const rawCap = rerankPriceCapByCategory[item.category]?.trim();
+    const parsedPriceCap = rawCap ? Number(rawCap) : Number.NaN;
+    const colorHint = rerankColorHintByCategory[item.category]?.trim();
+
     setJobError('');
     setRerankBusyCategory(item.category);
     try {
-      const res = await rerankJob(job.job_id, { category: item.category });
+      const res = await rerankJob(job.job_id, {
+        category: item.category,
+        price_cap: Number.isFinite(parsedPriceCap) ? parsedPriceCap : undefined,
+        color_hint: colorHint || undefined
+      });
       if (res.selected && job.items) {
         const next = job.items.map((entry) =>
           entry.category === item.category ? res.selected ?? entry : entry
@@ -178,6 +188,14 @@ export default function DashboardPage() {
     } finally {
       setRerankBusyCategory('');
     }
+  }
+
+  function setRerankPriceCap(category: string, value: string) {
+    setRerankPriceCapByCategory((prev) => ({ ...prev, [category]: value }));
+  }
+
+  function setRerankColorHint(category: string, value: string) {
+    setRerankColorHintByCategory((prev) => ({ ...prev, [category]: value }));
   }
 
   async function onApprove() {
@@ -386,14 +404,32 @@ export default function DashboardPage() {
                     <p className="font-medium">{item.brand ?? '-'} / {item.product_name ?? '-'}</p>
                     <p className="text-sm text-muted">product_id: {item.product_id ?? '-'}</p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => void onRerank(item)}
-                    disabled={!item.category || rerankBusyCategory === item.category}
-                    className="rounded-md border border-slate-300 px-3 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {rerankBusyCategory === item.category ? 'Reranking...' : 'Rerank'}
-                  </button>
+                  <div className="w-48 space-y-2">
+                    <input
+                      type="number"
+                      min={10000}
+                      step={1000}
+                      value={item.category ? (rerankPriceCapByCategory[item.category] ?? '') : ''}
+                      onChange={(e) => item.category && setRerankPriceCap(item.category, e.target.value)}
+                      placeholder="price cap"
+                      className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-xs"
+                    />
+                    <input
+                      type="text"
+                      value={item.category ? (rerankColorHintByCategory[item.category] ?? '') : ''}
+                      onChange={(e) => item.category && setRerankColorHint(item.category, e.target.value)}
+                      placeholder="color hint"
+                      className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void onRerank(item)}
+                      disabled={!item.category || rerankBusyCategory === item.category}
+                      className="w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {rerankBusyCategory === item.category ? 'Reranking...' : 'Rerank'}
+                    </button>
+                  </div>
                 </div>
 
                 <div className="mb-3 grid grid-cols-2 gap-2 text-sm">

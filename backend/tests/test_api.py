@@ -253,6 +253,36 @@ def test_rerank_error_scenarios(client: TestClient, monkeypatch: pytest.MonkeyPa
         assert candidate["price"] <= 43000
 
 
+def test_rerank_applies_color_hint_and_min_price_floor(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.service.random.random", lambda: 0.99)
+    job_id = _create_job(client, quality_mode="auto_gate", look_count=3)
+
+    _wait_for_status(
+        client,
+        job_id,
+        statuses={
+            JobStatus.MATCHED.value,
+            JobStatus.MATCHED_PARTIAL.value,
+            JobStatus.COMPOSED.value,
+            JobStatus.RENDERING.value,
+            JobStatus.COMPLETED.value,
+        },
+    )
+
+    rerank = client.post(
+        f"/v1/jobs/{job_id}/rerank",
+        json={"category": "shoes", "price_cap": 9000, "color_hint": "black"},
+    )
+    assert rerank.status_code == 200
+    payload = rerank.json()
+    assert payload["selected"]["category"] == "shoes"
+    assert "Black" in payload["selected"]["product_name"]
+    assert "color:black" in payload["selected"]["evidence_tags"]
+    for candidate in payload["candidates"]:
+        # Small caps are normalized to service floor.
+        assert candidate["price"] >= 10000
+
+
 def test_approve_error_scenarios(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     no_job = client.post(f"/v1/jobs/{uuid4()}/approve")
     assert no_job.status_code == 404

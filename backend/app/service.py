@@ -83,7 +83,7 @@ class JobService:
             if record.status in {JobStatus.FAILED, JobStatus.INGESTED, JobStatus.ANALYZED}:
                 raise HTTPException(status_code=409, detail="rerank not available in current status")
 
-            candidates = self._build_candidates(req.category, req.price_cap)
+            candidates = self._build_candidates(req.category, req.price_cap, req.color_hint)
             selected = candidates[0]
 
             replaced = False
@@ -235,28 +235,34 @@ class JobService:
         return items
 
     @staticmethod
-    def _build_candidates(category: str, price_cap: Optional[int]) -> list[MatchItem]:
+    def _build_candidates(category: str, price_cap: Optional[int], color_hint: Optional[str]) -> list[MatchItem]:
         cap = price_cap if price_cap is not None else 80000
+        safe_cap = max(cap, 10000)
+        color_hint_text = color_hint.strip().lower() if color_hint else ""
         candidates = []
         for idx in range(3):
-            price = max(19000, cap - idx * 5000)
+            # Keep prices bounded and deterministic while honoring user cap.
+            price = max(10000, safe_cap - idx * 5000)
             score = ScoreBreakdown(
                 image=0.80 - idx * 0.03,
                 text=0.70,
                 category=0.90,
-                price=0.85 if price <= cap else 0.50,
+                price=0.85 if price <= safe_cap else 0.50,
                 final=0.82 - idx * 0.02,
             )
+            evidence_tags = ["re_ranked", "budget_fit"]
+            if color_hint_text:
+                evidence_tags.append(f"color:{color_hint_text}")
             candidates.append(
                 MatchItem(
                     category=category,
                     product_id=f"R-{idx + 1}",
                     brand="MUSINSA",
-                    product_name=f"{category.title()} Candidate {idx + 1}",
+                    product_name=f"{category.title()} {color_hint_text.title() + ' ' if color_hint_text else ''}Candidate {idx + 1}",
                     price=price,
                     product_url=f"https://store.example.com/products/R-{idx + 1}",
                     image_url=f"https://store.example.com/images/R-{idx + 1}.jpg",
-                    evidence_tags=["re_ranked", "budget_fit"],
+                    evidence_tags=evidence_tags,
                     score_breakdown=score,
                 )
             )
