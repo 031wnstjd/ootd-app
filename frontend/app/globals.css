@@ -4,8 +4,116 @@
 
 :root {
   color-scheme: light;
+  --bg-0: #eef2f8;
+  --bg-1: #d9e3f3;
+  --bg-2: #f8fbff;
+  --surface: rgba(255, 255, 255, 0.8);
+  --surface-strong: rgba(255, 255, 255, 0.92);
+  --border: rgba(15, 23, 42, 0.12);
+  --text: #0f172a;
+  --text-muted: #4a607f;
+  --accent: #0369a1;
+  --ok: #15803d;
+  --warn: #b45309;
+  --bad: #b91c1c;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg-0: #020617;
+  --bg-1: #0b1220;
+  --bg-2: #111d33;
+  --surface: rgba(12, 23, 40, 0.72);
+  --surface-strong: rgba(14, 29, 50, 0.9);
+  --border: rgba(148, 163, 184, 0.2);
+  --text: #d8e6ff;
+  --text-muted: #9db2d6;
+  --accent: #38bdf8;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --bad: #ef4444;
 }
 
 body {
-  @apply m-0 bg-slate-100 text-ink antialiased;
+  margin: 0;
+  font-family: var(--font-body), sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 12% 18%, var(--bg-1), transparent 44%),
+    radial-gradient(circle at 88% 2%, var(--bg-2), transparent 42%),
+    linear-gradient(150deg, var(--bg-0), #0f172a08);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-heading), sans-serif;
+}
+
+.control-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.26),
+    0 16px 28px -22px rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(10px);
+}
+
+.control-card-strong {
+  background: var(--surface-strong);
+  border: 1px solid var(--border);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    0 18px 34px -24px rgba(2, 6, 23, 0.6);
+  backdrop-filter: blur(12px);
+}
+
+.text-muted-ui {
+  color: var(--text-muted);
+}
+
+.text-ok {
+  color: var(--ok);
+}
+
+.text-warn {
+  color: var(--warn);
+}
+
+.text-bad {
+  color: var(--bad);
+}
+
+.text-accent-ui {
+  color: var(--accent);
+}
+
+.status-chip {
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-strong) 88%, transparent);
+}
+
+.status-chip-active {
+  background: color-mix(in srgb, var(--accent) 24%, var(--surface-strong));
+  border-color: color-mix(in srgb, var(--accent) 54%, transparent);
+  color: var(--text);
+}
+
+.card-enter {
+  animation: card-enter 220ms ease-out both;
+}
+
+@keyframes card-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
