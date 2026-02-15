@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import colorsys
 import json
+import hashlib
 import math
 import os
 import random
@@ -121,11 +122,13 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "musinsa_catalog")
 QDRANT_TOPK_MULTIPLIER = int(os.getenv("QDRANT_TOPK_MULTIPLIER", "12"))
 QDRANT_TIMEOUT_SECONDS = float(os.getenv("QDRANT_TIMEOUT_SECONDS", "10"))
 QDRANT_UPSERT_BATCH_SIZE = int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", "200"))
+QDRANT_UPSERT_WAIT = os.getenv("QDRANT_UPSERT_WAIT", "1") == "1"
 CATEGORY_QUERY_PRIORITY = ["top", "bottom", "outer", "shoes", "bag"]
 DEFAULT_TARGET_GENDER = os.getenv("DEFAULT_TARGET_GENDER", "men")
 SEMANTIC_EMBEDDING_BACKEND = os.getenv("SEMANTIC_EMBEDDING_BACKEND", "clip").strip().lower()
 CLIP_MODEL_NAME = os.getenv("CLIP_MODEL_NAME", "openai/clip-vit-base-patch16")
 CLIP_DEVICE = os.getenv("CLIP_DEVICE", "auto").strip().lower()
+SIMULATE_RANDOM_FAILURES = os.getenv("SIMULATE_RANDOM_FAILURES", "0") == "1"
 GENDER_MEN_TOKENS = [
     "남성",
     "남자",
@@ -436,19 +439,24 @@ class JobService:
         indexed = 0
         if httpx is None:
             return CatalogIndexRebuildResponse(total_products=len(items), total_indexed_products=0)
-        with httpx.Client(timeout=4.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        with httpx.Client(timeout=6.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
             for item in items:
-                embedding = self._embedding_from_url(item.image_url, client=client)
+                # In clip mode, avoid recomputing vectors that are already clip-sized.
+                if self._semantic_backend == "clip" and len(item.embedding) >= 512:
+                    embedding = item.embedding
+                else:
+                    embedding = self._embedding_from_url(item.image_url, client=client)
                 if embedding:
                     with self._lock:
                         existing = self._catalog.get(item.product_id)
                         if existing:
                             existing.embedding = embedding
                             existing.updated_at = datetime.now(timezone.utc)
-                            self._upsert_qdrant_item(existing)
                     indexed += 1
 
         with self._lock:
+            snapshot = list(self._catalog.values())
+            self._sync_qdrant(snapshot, mode=CrawlMode.full)
             self._last_full_reindex_at = datetime.now(timezone.utc)
             self._persist_locked()
             return CatalogIndexRebuildResponse(total_products=len(self._catalog), total_indexed_products=indexed)
@@ -663,7 +671,7 @@ class JobService:
                 self._persist_locked()
                 return
 
-            if rec.had_partial_match and random.random() < 0.5:
+            if rec.had_partial_match and SIMULATE_RANDOM_FAILURES and random.random() < 0.5:
                 rec.status = JobStatus.FAILED
                 rec.progress = 100
                 rec.completed_at = datetime.now(timezone.utc)
@@ -674,7 +682,7 @@ class JobService:
                 self._persist_locked()
                 return
 
-            if random.random() < 0.05:
+            if SIMULATE_RANDOM_FAILURES and random.random() < 0.05:
                 rec.status = JobStatus.FAILED
                 rec.progress = 100
                 rec.completed_at = datetime.now(timezone.utc)
@@ -797,6 +805,8 @@ class JobService:
         semantic_query_vectors = self._query_semantic_vectors_by_category(upload_image_path)
         query_style = self._query_style_signatures_by_category(upload_image_path)
         global_query_vector = query_vectors.get("global", [])
+        clip_primary_active = self._semantic_backend == "clip" and len(global_query_vector) >= 512
+        query_dim = len(global_query_vector)
         if not global_query_vector:
             return [], roi_debug
 
@@ -832,15 +842,25 @@ class JobService:
                 continue
             if not item.embedding:
                 continue
+            if clip_primary_active and len(item.embedding) != query_dim:
+                continue
             item_query = self._compose_query_vector(item.category, query_vectors)
             if not item_query:
                 item_query = global_query_vector
-            image_sim = self._cosine_similarity(item_query, item.embedding)
+            image_sim_raw = self._cosine_similarity_signed(item_query, item.embedding)
+            image_sim = ((image_sim_raw + 1.0) / 2.0) if clip_primary_active else max(0.0, image_sim_raw)
             semantic_sim = self._semantic_similarity(item=item, category=item.category, query_vectors=semantic_query_vectors)
-            blended_image_sim = image_sim
-            if semantic_sim > 0:
-                blended_image_sim = (0.45 * image_sim) + (0.55 * semantic_sim)
-            min_image_sim = 0.0 if item.product_id.startswith("fallback-") else CATALOG_MIN_IMAGE_SIM
+            if clip_primary_active:
+                # In clip mode, item/query vectors are already CLIP vectors.
+                blended_image_sim = image_sim
+                semantic_sim = 0.0
+            else:
+                blended_image_sim = image_sim
+                if semantic_sim > 0:
+                    blended_image_sim = (0.45 * image_sim) + (0.55 * semantic_sim)
+            min_image_sim = 0.0 if item.product_id.startswith("fallback-") else (
+                max(0.15, min(0.95, CATALOG_MIN_IMAGE_SIM - 0.08)) if clip_primary_active else CATALOG_MIN_IMAGE_SIM
+            )
             if blended_image_sim < min_image_sim:
                 continue
             text_score = 0.0
@@ -867,13 +887,22 @@ class JobService:
                 item_name=f"{item.brand} {item.product_name}",
             )
             meta_score = (0.58 * style_score) + (0.22 * color_score) + (0.20 * attr_score)
-            final = (
-                (0.54 * blended_image_sim)
-                + (0.18 * style_score)
-                + (0.20 * color_score)
-                + (0.06 * attr_score)
-                + (0.02 * price_score)
-            ) * style_penalty
+            if clip_primary_active:
+                final = (
+                    (0.74 * blended_image_sim)
+                    + (0.14 * style_score)
+                    + (0.08 * color_score)
+                    + (0.03 * attr_score)
+                    + (0.01 * price_score)
+                ) * style_penalty
+            else:
+                final = (
+                    (0.54 * blended_image_sim)
+                    + (0.18 * style_score)
+                    + (0.20 * color_score)
+                    + (0.06 * attr_score)
+                    + (0.02 * price_score)
+                ) * style_penalty
             score = ScoreBreakdown(
                 image=round(blended_image_sim, 4),
                 text=round(text_score, 4),
@@ -889,7 +918,7 @@ class JobService:
                 f"query_region:{query_region}",
                 f"category:{item.category}",
                 "source:crawled",
-                "model:hist-embed",
+                f"model:{'clip-embed' if clip_primary_active else 'hist-embed'}",
                 "rerank:style-signature",
                 "rerank:color-compat",
                 "rerank:attr-compat",
@@ -1016,7 +1045,7 @@ class JobService:
                 rgb = img.convert("RGB")
                 width, height = rgb.size
                 if width < 16 or height < 16:
-                    global_vec = self._embedding_from_image(rgb)
+                    global_vec = self._primary_embedding_from_image(rgb)
                     roi = {"global": RoiRegion(category="global", bbox=[0.0, 0.0, 1.0, 1.0], confidence=0.5)}
                     return {"global": global_vec}, roi
 
@@ -1027,21 +1056,21 @@ class JobService:
                     bottom = max(top + 1, min(height, int(height * y2)))
                     return (left, top, right, bottom)
 
-                vectors: dict[str, list[float]] = {"global": self._embedding_from_image(rgb)}
+                vectors: dict[str, list[float]] = {"global": self._primary_embedding_from_image(rgb)}
                 regions: dict[str, RoiRegion] = {
                     "global": RoiRegion(category="global", bbox=[0.0, 0.0, 1.0, 1.0], confidence=0.92)
                 }
-                vectors["top"] = self._embedding_from_image(rgb.crop(crop_box(0.10, 0.05, 0.90, 0.46)))
+                vectors["top"] = self._primary_embedding_from_image(rgb.crop(crop_box(0.10, 0.05, 0.90, 0.46)))
                 regions["top"] = RoiRegion(category="top", bbox=[0.10, 0.05, 0.90, 0.46], confidence=0.86)
-                vectors["bottom"] = self._embedding_from_image(rgb.crop(crop_box(0.16, 0.40, 0.84, 0.78)))
+                vectors["bottom"] = self._primary_embedding_from_image(rgb.crop(crop_box(0.16, 0.40, 0.84, 0.78)))
                 regions["bottom"] = RoiRegion(category="bottom", bbox=[0.16, 0.40, 0.84, 0.78], confidence=0.88)
-                vectors["outer"] = self._embedding_from_image(rgb.crop(crop_box(0.06, 0.02, 0.94, 0.60)))
+                vectors["outer"] = self._primary_embedding_from_image(rgb.crop(crop_box(0.06, 0.02, 0.94, 0.60)))
                 regions["outer"] = RoiRegion(category="outer", bbox=[0.06, 0.02, 0.94, 0.60], confidence=0.74)
-                vectors["shoes"] = self._embedding_from_image(rgb.crop(crop_box(0.15, 0.80, 0.85, 0.99)))
+                vectors["shoes"] = self._primary_embedding_from_image(rgb.crop(crop_box(0.15, 0.80, 0.85, 0.99)))
                 regions["shoes"] = RoiRegion(category="shoes", bbox=[0.15, 0.80, 0.85, 0.99], confidence=0.70)
 
-                bag_left = self._embedding_from_image(rgb.crop(crop_box(0.00, 0.25, 0.38, 0.80)))
-                bag_right = self._embedding_from_image(rgb.crop(crop_box(0.62, 0.25, 1.00, 0.80)))
+                bag_left = self._primary_embedding_from_image(rgb.crop(crop_box(0.00, 0.25, 0.38, 0.80)))
+                bag_right = self._primary_embedding_from_image(rgb.crop(crop_box(0.62, 0.25, 1.00, 0.80)))
                 vectors["bag"] = self._normalize_vector([(a + b) / 2.0 for a, b in zip(bag_left, bag_right)])
                 regions["bag"] = RoiRegion(category="bag", bbox=[0.00, 0.25, 1.00, 0.80], confidence=0.58)
                 return vectors, regions
@@ -1049,42 +1078,9 @@ class JobService:
             return {}, {}
 
     def _query_semantic_vectors_by_category(self, upload_image_path: Optional[str]) -> dict[str, list[float]]:
-        if self._semantic_backend != "clip":
-            return {}
-        if not upload_image_path or Image is None:
-            return {}
-        path = Path(upload_image_path)
-        if not path.exists():
-            return {}
-        try:
-            with Image.open(path) as img:
-                rgb = img.convert("RGB")
-                width, height = rgb.size
-                if width < 16 or height < 16:
-                    return {"global": self._semantic_embedding_from_image(rgb)}
-
-                def crop_box(x1: float, y1: float, x2: float, y2: float) -> tuple[int, int, int, int]:
-                    left = max(0, min(width - 1, int(width * x1)))
-                    top = max(0, min(height - 1, int(height * y1)))
-                    right = max(left + 1, min(width, int(width * x2)))
-                    bottom = max(top + 1, min(height, int(height * y2)))
-                    return (left, top, right, bottom)
-
-                out: dict[str, list[float]] = {}
-                out["global"] = self._semantic_embedding_from_image(rgb)
-                out["top"] = self._semantic_embedding_from_image(rgb.crop(crop_box(0.10, 0.05, 0.90, 0.46)))
-                out["bottom"] = self._semantic_embedding_from_image(rgb.crop(crop_box(0.16, 0.40, 0.84, 0.78)))
-                out["outer"] = self._semantic_embedding_from_image(rgb.crop(crop_box(0.06, 0.02, 0.94, 0.60)))
-                out["shoes"] = self._semantic_embedding_from_image(rgb.crop(crop_box(0.15, 0.80, 0.85, 0.99)))
-                left_sem = self._semantic_embedding_from_image(rgb.crop(crop_box(0.00, 0.25, 0.38, 0.80)))
-                right_sem = self._semantic_embedding_from_image(rgb.crop(crop_box(0.62, 0.25, 1.00, 0.80)))
-                if left_sem and right_sem and len(left_sem) == len(right_sem):
-                    out["bag"] = self._normalize_vector([(a + b) / 2.0 for a, b in zip(left_sem, right_sem)])
-                else:
-                    out["bag"] = out["global"]
-                return out
-        except Exception:
-            return {}
+        # Semantic side-channel is disabled because we already use a single
+        # primary embedding space (hist or clip) end-to-end.
+        return {}
 
     def _semantic_similarity(self, item: CatalogItemRecord, category: str, query_vectors: dict[str, list[float]]) -> float:
         if self._semantic_backend != "clip":
@@ -1269,7 +1265,25 @@ class JobService:
         if self._qdrant_client is None or qdrant_models is None or vector_size <= 0:
             return
         try:
-            self._qdrant_client.get_collection(QDRANT_COLLECTION)
+            info = self._qdrant_client.get_collection(QDRANT_COLLECTION)
+            existing_size = None
+            vectors = getattr(getattr(getattr(info, "config", None), "params", None), "vectors", None)
+            if isinstance(vectors, dict):
+                for value in vectors.values():
+                    existing_size = getattr(value, "size", None)
+                    if existing_size is not None:
+                        break
+            else:
+                existing_size = getattr(vectors, "size", None)
+            if isinstance(existing_size, int) and existing_size > 0 and existing_size != vector_size:
+                self._qdrant_client.delete_collection(QDRANT_COLLECTION)
+                self._qdrant_client.recreate_collection(
+                    collection_name=QDRANT_COLLECTION,
+                    vectors_config=qdrant_models.VectorParams(
+                        size=vector_size,
+                        distance=qdrant_models.Distance.COSINE,
+                    ),
+                )
         except Exception:
             self._qdrant_client.recreate_collection(
                 collection_name=QDRANT_COLLECTION,
@@ -1283,7 +1297,10 @@ class JobService:
         if self._qdrant_client is None or qdrant_models is None:
             self._set_crawl_timestamp(mode)
             return
-        valid = [item for item in items if item.embedding]
+        if self._semantic_backend == "clip":
+            valid = [item for item in items if item.embedding and len(item.embedding) >= 512]
+        else:
+            valid = [item for item in items if item.embedding]
         if not valid:
             self._set_crawl_timestamp(mode)
             return
@@ -1307,12 +1324,12 @@ class JobService:
                     "image_url": item.image_url,
                     "updated_at": item.updated_at.isoformat(),
                 }
-                pid = abs(hash(item.product_id)) % (2**63 - 1)
+                pid = self._qdrant_point_id(item.product_id)
                 points.append(qdrant_models.PointStruct(id=pid, vector=item.embedding, payload=payload))
             if points:
                 for idx in range(0, len(points), max(1, QDRANT_UPSERT_BATCH_SIZE)):
                     batch = points[idx : idx + max(1, QDRANT_UPSERT_BATCH_SIZE)]
-                    self._qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=batch, wait=False)
+                    self._qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=batch, wait=QDRANT_UPSERT_WAIT)
         except Exception:
             # Degrade gracefully: crawl/index should still complete even if vector sync is unstable.
             pass
@@ -1333,14 +1350,20 @@ class JobService:
                 "image_url": item.image_url,
                 "updated_at": item.updated_at.isoformat(),
             }
-            pid = abs(hash(item.product_id)) % (2**63 - 1)
+            pid = self._qdrant_point_id(item.product_id)
             self._qdrant_client.upsert(
                 collection_name=QDRANT_COLLECTION,
                 points=[qdrant_models.PointStruct(id=pid, vector=item.embedding, payload=payload)],
-                wait=False,
+                wait=QDRANT_UPSERT_WAIT,
             )
         except Exception:
             pass
+
+    @staticmethod
+    def _qdrant_point_id(product_id: str) -> int:
+        digest = hashlib.blake2b(product_id.encode("utf-8"), digest_size=8).digest()
+        value = int.from_bytes(digest, "big", signed=False)
+        return max(1, value & ((1 << 63) - 1))
 
     def _qdrant_search_candidates(
         self,
@@ -1712,6 +1735,11 @@ class JobService:
 
     @staticmethod
     def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
+        score = JobService._cosine_similarity_signed(v1, v2)
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _cosine_similarity_signed(v1: list[float], v2: list[float]) -> float:
         if not v1 or not v2 or len(v1) != len(v2):
             return 0.0
         dot = sum(a * b for a, b in zip(v1, v2))
@@ -1719,7 +1747,7 @@ class JobService:
         n2 = math.sqrt(sum(b * b for b in v2))
         if n1 == 0 or n2 == 0:
             return 0.0
-        return max(0.0, min(1.0, dot / (n1 * n2)))
+        return max(-1.0, min(1.0, dot / (n1 * n2)))
 
     @staticmethod
     def _text_hint_score(name: str, color_hint: str) -> float:
@@ -1946,7 +1974,7 @@ class JobService:
             return []
         try:
             with Image.open(path) as img:
-                return self._embedding_from_image(img)
+                return self._primary_embedding_from_image(img)
         except Exception:
             return []
 
@@ -2087,7 +2115,12 @@ class JobService:
                 else:
                     device = "cuda" if torch.cuda.is_available() else "cpu"
                 self._semantic_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
-                self._semantic_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
+                try:
+                    # Torch 2.5.x blocks legacy torch.load paths for security;
+                    # safetensors avoids that path and works without torch>=2.6.
+                    self._semantic_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME, use_safetensors=True)
+                except Exception:
+                    self._semantic_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
                 self._semantic_model.to(device)
                 self._semantic_model.eval()
                 self._semantic_device = device
@@ -2111,7 +2144,13 @@ class JobService:
             inputs = self._semantic_processor(images=img.convert("RGB"), return_tensors="pt")
             inputs = {k: v.to(self._semantic_device) for k, v in inputs.items()}
             with torch.no_grad():
-                image_features = self._semantic_model.get_image_features(**inputs)
+                image_features = self._semantic_model.get_image_features(pixel_values=inputs["pixel_values"])
+                if not torch.is_tensor(image_features):
+                    image_features = getattr(image_features, "image_embeds", None) or getattr(
+                        image_features, "pooler_output", None
+                    )
+                if image_features is None or not torch.is_tensor(image_features):
+                    return self._embedding_from_image(img)
                 image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
             return image_features[0].detach().cpu().tolist()
         except Exception:
@@ -2150,9 +2189,16 @@ class JobService:
                     return []
                 cache_path.write_bytes(resp.content)
             with Image.open(cache_path) as img:
-                return self._embedding_from_image(img)
+                return self._primary_embedding_from_image(img)
         except Exception:
             return []
+
+    def _primary_embedding_from_image(self, img: "Image.Image") -> list[float]:
+        if self._semantic_backend == "clip":
+            vec = self._semantic_embedding_from_image(img)
+            if vec:
+                return vec
+        return self._embedding_from_image(img)
 
     def _embedding_from_image(self, img: "Image.Image") -> list[float]:
         rgb = img.convert("RGB")
