@@ -91,7 +91,11 @@ npm run build
 - PR/`main` push 시 실행:
   - `backend` API 테스트
   - Docker Compose 스모크 2회 반복(`scripts/compose-smoke.sh`)
-- Compose 단계 실패 시 `compose-logs.txt`, `compose-ps.txt` 아티팩트 업로드
+- Compose 단계 종료 시 진단 아티팩트 업로드:
+  - `compose-logs.txt`
+  - `compose-ps.txt`
+  - `compose-flake-classification.txt` (1차 원인 라벨)
+- 수동 실행(`workflow_dispatch`)에서 `smoke_runs` 입력으로 반복 횟수 조정 가능
 
 ## Permission Recovery (`EACCES`)
 

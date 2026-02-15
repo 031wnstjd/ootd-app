@@ -5,6 +5,12 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      smoke_runs:
+        description: "Compose smoke repeat count"
+        required: false
+        default: "2"
 
 jobs:
   backend-tests:
@@ -28,11 +34,11 @@ jobs:
       run:
         working-directory: .
     env:
-      SMOKE_RUNS: "2"
+      SMOKE_RUNS: ${{ github.event.inputs.smoke_runs || '2' }}
     steps:
       - uses: actions/checkout@v4
       - name: Ensure scripts are executable
-        run: chmod +x scripts/preflight-port.sh scripts/compose-smoke.sh
+        run: chmod +x scripts/preflight-port.sh scripts/compose-smoke.sh scripts/classify-compose-flake.sh
       - name: Run compose smoke repeatedly
         run: |
           mkdir -p artifacts
@@ -49,6 +55,11 @@ jobs:
           mkdir -p artifacts
           docker compose -f docker-compose.yml ps > artifacts/compose-ps.txt || true
           docker compose -f docker-compose.yml logs --no-color > artifacts/compose-logs.txt || true
+      - name: Classify compose failure root cause
+        if: always()
+        run: |
+          ./scripts/classify-compose-flake.sh artifacts/compose-logs.txt artifacts/compose-ps.txt artifacts/compose-flake-classification.txt
+          cat artifacts/compose-flake-classification.txt
       - name: Upload compose diagnostics
         if: always()
         uses: actions/upload-artifact@v4
