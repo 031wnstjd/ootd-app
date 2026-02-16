@@ -50,7 +50,7 @@ services:
     environment:
       - NEXT_PUBLIC_API_BASE=http://localhost:8000
     command: >
-      sh -lc "npm ci --no-audit --no-fund && rm -rf .next/* && npm run dev -- --hostname 0.0.0.0 --port ${FRONTEND_PORT:-3005}"
+      sh -lc "if [ ! -x node_modules/.bin/next ]; then npm ci --no-audit --no-fund; fi; npm run dev -- --hostname 0.0.0.0 --port ${FRONTEND_PORT:-3005}"
     ports:
       - "${FRONTEND_PORT:-3005}:${FRONTEND_PORT:-3005}"
     depends_on:
